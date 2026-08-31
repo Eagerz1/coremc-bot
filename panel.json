@@ -1,0 +1,28 @@
+{
+  "embeds": [
+    {
+      "title": "CoreMC - Support",
+      "description": "**Need help? Open a ticket below.**\n\nPick the option that fits your issue and a private ticket will be created for you.\n\n\ud83d\udc54 \u2014 speak with management\n\ud83d\udc1b \u2014 report a bug you found\n\ud83d\udea9 \u2014 report a player breaking rules\n\ud83d\udee1\ufe0f \u2014 report a staff member\n\u2753 \u2014 anything else you want to ask\n\ud83c\udfa5 \u2014 media & content creator requests\n\n\u26a0\ufe0f Abuse of the ticket system will result in punishment.",
+      "color": 5793266,
+      "footer": { "text": "CoreMC \u2022 Support Team" }
+    }
+  ],
+  "components": [
+    {
+      "type": 1,
+      "components": [
+        { "type": 2, "style": 1, "label": "Manager Support", "emoji": { "name": "\ud83d\udc54" }, "custom_id": "ticket_open_mgr" },
+        { "type": 2, "style": 4, "label": "Bugs", "emoji": { "name": "\ud83d\udc1b" }, "custom_id": "ticket_open_bug" },
+        { "type": 2, "style": 2, "label": "Report a Player", "emoji": { "name": "\ud83d\udea9" }, "custom_id": "ticket_open_player" }
+      ]
+    },
+    {
+      "type": 1,
+      "components": [
+        { "type": 2, "style": 3, "label": "Report Staff", "emoji": { "name": "\ud83d\udee1\ufe0f" }, "custom_id": "ticket_open_staff" },
+        { "type": 2, "style": 1, "label": "General Questions", "emoji": { "name": "\u2753" }, "custom_id": "ticket_open_general" },
+        { "type": 2, "style": 2, "label": "Media", "emoji": { "name": "\ud83c\udfa5" }, "custom_id": "ticket_open_media" }
+      ]
+    }
+  ]
+}

@@ -1,10 +1,13 @@
 // CoreMC moderation & staff management commands (permission-hierarchy gated).
+// Targets can be a userID, a <@mention>, or a username/displayName/nickname.
+// Every punishment is recorded in the punishments store AND logged as a player note.
 const {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
 } = require('discord.js');
 const perms = require('./permissions');
+const notes = require('./notes');
 
 // ---------------------------------------------------------------- helpers
 function parseDuration(str) {
@@ -44,36 +47,85 @@ async function dmPunish(target, { emoji, type, color, reason, staff, duration })
       ].filter(Boolean).join('\n')
     )
     .setTimestamp();
-  try { await target.send({ embeds: [emb] }).catch(() => {}); } catch {}
+  try { await target.send({ embeds: [emb] }); } catch {}
+}
+
+// Resolve a raw target string -> { user, member }.
+// Accepts: <@ID> / <@!ID>, a bare snowflake ID, or a username/displayName/nickname.
+async function resolveTarget(interaction, raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { user: null, member: null };
+  const idMatch = s.match(/^(?:<@!?)?(\d{17,19})>?$/);
+  if (idMatch) {
+    const userId = idMatch[1];
+    const user = await interaction.client.users.fetch(userId).catch(() => null);
+    if (!user) return { user: null, member: null };
+    const member = await interaction.guild.members.fetch(userId).catch(() => null);
+    return { user, member };
+  }
+  // username / displayName / nickname / tag lookup against cached members
+  const lower = s.toLowerCase();
+  const all = [...interaction.guild.members.cache.values()];
+  const eq = (v) => v && v.toLowerCase() === lower;
+  const exact = all.find((m) =>
+    eq(m.user?.username) || eq(m.user?.displayName) || eq(m.nickname) || eq(m.user?.tag)
+  );
+  if (exact) return { user: exact.user, member: exact };
+  const prefix = all.find((m) =>
+    (m.user?.username && m.user.username.toLowerCase().startsWith(lower)) ||
+    (m.nickname && m.nickname.toLowerCase().startsWith(lower))
+  );
+  if (prefix) return { user: prefix.user, member: prefix };
+  return { user: null, member: null };
+}
+
+// Log a punishment into the player-notes store so notes & mod actions stay together.
+async function punishmentNote({ user, type, tier = null, reason, duration, evidence, staff, caseId }) {
+  const lines = [
+    `Punishment: ${type}${tier ? ` ${tier}` : ''}${caseId ? ` (case \`${caseId}\`)` : ''}`,
+    `Reason: ${reason || 'No reason provided'}`,
+    ...(duration ? [`Duration: ${duration}`] : []),
+    ...(evidence ? [`Evidence: ${evidence}`] : []),
+    `Staff: ${staff.tag || staff.username || String(staff)}`,
+  ];
+  const noteId = `N-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2).toUpperCase()}`;
+  return notes.addNote({
+    userId: user.id,
+    username: user.username || String(user),
+    noteId,
+    content: lines.join('\n'),
+    staffId: staff.id,
+    staffUsername: staff.tag || staff.username || String(staff),
+  });
 }
 
 // ---------------------------------------------------------------- command defs
 const commands = [
   new SlashCommandBuilder()
     .setName('warn').setDescription('Issue a warning (Helper+)')
-    .addUserOption(o => o.setName('user').setDescription('Member to warn').setRequired(true))
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
     .addStringOption(o => o.setName('evidence').setDescription('Link / screenshot reference')),
   new SlashCommandBuilder()
     .setName('mute').setDescription('Timeout a member in Discord (Helper+, max 7d)')
-    .addUserOption(o => o.setName('user').setDescription('Member to mute').setRequired(true))
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true))
     .addStringOption(o => o.setName('duration').setDescription('e.g. 10m, 1h, 1d, 1w').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
   new SlashCommandBuilder()
     .setName('unmute').setDescription('Remove Discord timeout (Moderator+)')
-    .addUserOption(o => o.setName('user').setDescription('Member').setRequired(true)),
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true)),
   new SlashCommandBuilder()
     .setName('kick').setDescription('Kick a member from Discord (Helper+)')
-    .addUserOption(o => o.setName('user').setDescription('Member to kick').setRequired(true))
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
   new SlashCommandBuilder()
     .setName('ban').setDescription('Ban a member from Discord (Moderator+)')
-    .addUserOption(o => o.setName('user').setDescription('Member to ban').setRequired(true))
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
     .addIntegerOption(o => o.setName('days').setDescription('Delete message days (0-7)')),
   new SlashCommandBuilder()
     .setName('punishments').setDescription('Punishment history of a member (Moderator+)')
-    .addUserOption(o => o.setName('user').setDescription('Member').setRequired(true)),
+    .addStringOption(o => o.setName('user').setDescription('User ID, @mention, or username').setRequired(true)),
   new SlashCommandBuilder()
     .setName('stafflist').setDescription('Show the staff team by rank'),
   new SlashCommandBuilder()
@@ -99,37 +151,42 @@ const commands = [
 async function handle(interaction) {
   const cmd = interaction.commandName;
   const P = perms.L;
+  // shared target resolution guard
+  const TARGET_CMDS = ['warn', 'mute', 'unmute', 'kick', 'ban', 'punishments'];
 
   switch (cmd) {
     case 'warn': {
       if (!await perms.gate(interaction, 'punishment.warn')) return;
-      const target = interaction.options.getUser('user');
+      const { user: target, member } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username (must be a server member for a name lookup).', ephemeral: true });
       const reason = interaction.options.getString('reason');
       const evidence = interaction.options.getString('evidence');
       const entry = await perms.recordPunishment({ type: 'Warning', tier: null, target, staff: interaction.user, reason, evidence });
+      await punishmentNote({ user: target, type: 'Warning', reason, evidence, staff: interaction.user, caseId: entry.id });
       await dmPunish(target, { emoji: '⚠️', type: 'Warning', color: 0xfee75c, reason, staff: interaction.user });
       return replyLog(interaction, `⚠️ Warning issued — ${entry.id}`, `${target} warned by ${interaction.user}\n**Reason:** ${reason}${evidence ? `\n**Evidence:** ${evidence}` : ''}`, 0xfee75c);
     }
 
     case 'mute': {
       if (!await perms.gate(interaction, 'moderation.mute')) return;
-      const target = interaction.options.getUser('user');
+      const { user: target, member } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username.', ephemeral: true });
       const dur = parseDuration(interaction.options.getString('duration'));
       if (!dur || dur.ms > 7 * 86400000) return interaction.reply({ content: '❌ Duration must be like `10m`, `1h`, `1d` (max 7d for Discord timeout).', ephemeral: true });
       const reason = interaction.options.getString('reason');
-      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
-      if (!member) return interaction.reply({ content: '❌ Member not found in this server.', ephemeral: true });
+      if (!member) return interaction.reply({ content: '❌ Member not found in this server (name lookup needs a server member; use the user ID).', ephemeral: true });
       if (perms.levelOf(member) >= perms.levelOf(interaction.member)) return interaction.reply({ content: '❌ You cannot mute an equal or higher-ranked staff member.', ephemeral: true });
       await member.timeout(dur.ms, `${reason} (by ${interaction.user.tag})`);
       await dmPunish(target, { emoji: '🔇', type: 'Mute', color: 0xfee75c, reason, staff: interaction.user, duration: dur.label });
       const entry = await perms.recordPunishment({ type: 'Mute', tier: null, target, staff: interaction.user, reason, duration: dur.label });
+      await punishmentNote({ user: target, type: 'Mute', reason, duration: dur.label, staff: interaction.user, caseId: entry.id });
       return replyLog(interaction, `🔇 Muted — ${entry.id}`, `${target} muted for **${dur.label}** by ${interaction.user}\n**Reason:** ${reason}`, 0xfee75c);
     }
 
     case 'unmute': {
       if (!await perms.gate(interaction, 'punishment.T5')) return;
-      const target = interaction.options.getUser('user');
-      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+      const { user: target, member } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username.', ephemeral: true });
       if (!member) return interaction.reply({ content: '❌ Member not found.', ephemeral: true });
       await member.timeout(null, `Unmuted by ${interaction.user.tag}`);
       await perms.log({ title: '🔊 Mute lifted', fields: [{ name: 'Player', value: `<@${target.id}>`, inline: true }, { name: 'Staff', value: `${interaction.user}`, inline: true }], color: 'good' });
@@ -138,23 +195,24 @@ async function handle(interaction) {
 
     case 'kick': {
       if (!await perms.gate(interaction, 'moderation.kick')) return;
-      const target = interaction.options.getUser('user');
+      const { user: target, member } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username.', ephemeral: true });
       const reason = interaction.options.getString('reason');
-      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
-      if (!member) return interaction.reply({ content: '❌ Member not found.', ephemeral: true });
+      if (!member) return interaction.reply({ content: '❌ Member not found in this server (name lookup needs a server member; use the user ID).', ephemeral: true });
       if (perms.levelOf(member) >= perms.levelOf(interaction.member)) return interaction.reply({ content: '❌ You cannot kick an equal or higher-ranked staff member.', ephemeral: true });
       await dmPunish(target, { emoji: '👢', type: 'Kick', color: 0xed4245, reason, staff: interaction.user });
       await member.kick(`${reason} (by ${interaction.user.tag})`);
       const entry = await perms.recordPunishment({ type: 'Kick', tier: null, target, staff: interaction.user, reason });
+      await punishmentNote({ user: target, type: 'Kick', reason, staff: interaction.user, caseId: entry.id });
       return replyLog(interaction, `👢 Kicked — ${entry.id}`, `${target} kicked by ${interaction.user}\n**Reason:** ${reason}`, 0xed4245);
     }
 
     case 'ban': {
       if (!await perms.gate(interaction, 'moderation.ban')) return;
-      const target = interaction.options.getUser('user');
+      const { user: target, member } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username.', ephemeral: true });
       const reason = interaction.options.getString('reason');
       const days = Math.min(Math.max(interaction.options.getInteger('days') ?? 0, 0), 7);
-      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
       if (member && perms.levelOf(member) >= perms.levelOf(interaction.member)) {
         return interaction.reply({ content: '❌ You cannot ban an equal or higher-ranked staff member.', ephemeral: true });
       }
@@ -163,12 +221,14 @@ async function handle(interaction) {
         throw new Error(`ban failed: ${e.message}`);
       });
       const entry = await perms.recordPunishment({ type: 'Ban', tier: null, target, staff: interaction.user, reason });
+      await punishmentNote({ user: target, type: 'Ban', reason, staff: interaction.user, caseId: entry.id });
       return replyLog(interaction, `🔨 Banned — ${entry.id}`, `${target} banned by ${interaction.user}\n**Reason:** ${reason}`, 0xed4245);
     }
 
     case 'punishments': {
       if (!await perms.gate(interaction, 'punishment.T5')) return;
-      const target = interaction.options.getUser('user');
+      const { user: target } = await resolveTarget(interaction, interaction.options.getString('user'));
+      if (!target) return interaction.reply({ content: '❌ User not found — give a valid user ID, @mention, or username.', ephemeral: true });
       const list = perms.punishmentsOf(target.id);
       if (!list.length) return interaction.reply({ content: `${target} has a clean record. ✨` });
       const lines = list.slice(-10).reverse().map(p =>

@@ -1,31 +1,1529 @@
-// CoreMC - Support — tickets, chat XP rewards, invite keys, welcome, giveawaysconst fs = require('fs');
-// CoreMC - Support — tickets, chat XP rewards, invite keys, welcome, giveawaysconst fs = require('fs');const path = require('path');const http = require('http');const {  Client,  GatewayIntentBits,  Partials,  REST,  Routes,  SlashCommandBuilder,  ActionRowBuilder,  ButtonBuilder,  ButtonStyle,  EmbedBuilder,  PermissionFlagsBits,  ChannelType,  OverwriteType,  ModalBuilder,  TextInputBuilder,  TextInputStyle,} = require('discord.js');// ---------------------------------------------------------------- configconst cfgPath = path.join(__dirname, 'config.json');function loadConfig() {  const defaults = {    token: '',    clientId: '',    guildId: '',    supportRoleId: '',    categoryId: '',    logChannelId: '',    panelChannelId: '',    welcomeChannelId: '',    chatRewardsChannelId: '',    rulesChannelId: '',    giveawayChannelId: '',    chatLevelRoleIds: {},   // { "5": roleId, "10": roleId }    inviteRewards: [],      // [{ invites: 3, roleId, label }]  };  try {    return { ...defaults, ...JSON.parse(fs.readFileSync(cfgPath, 'utf8')) };  } catch {    return defaults;  }}let config = loadConfig();const missingCreds = ['token', 'clientId', 'guildId'].filter((k) => !config[k]);global.cfg = config;// ---------------------------------------------------------------- panelsconst TICKET_TOPICS = [  { id: 'general', label: 'General Support', emoji: '❓', color: ButtonStyle.Primary,   desc: 'questions & help — handled by Helper+', perm: 'ticket.general_support', queue: 'general_support', category: 'general_support', pings: ['jrstaff'] },  { id: 'manager', label: 'Manager Support', emoji: '👑', color: ButtonStyle.Success,   desc: 'management & escalations — Managers only', perm: 'ticket.manager', queue: 'manager', category: 'manager', pings: ['higherstaff'] },  { id: 'media',   label: 'Media',           emoji: '🎥', color: ButtonStyle.Secondary, desc: 'content creator & media requests', perm: 'ticket.media', queue: 'media', category: 'staff', pings: ['media'] },  { id: 'appeals', label: 'Punishment Appeal', emoji: '⚖️', color: ButtonStyle.Danger,  desc: 'contest a punishment — Junior Admin+', perm: 'ticket.punishment_appeal', queue: 'punishment_appeal', category: 'admin_tickets', pings: ['punishments', 'higherstaff'] },  { id: 'refunds', label: 'Refunds',         emoji: '💸', color: ButtonStyle.Primary,   desc: 'purchase & store issues — Junior Admin+', perm: 'ticket.refunds', queue: 'refunds', category: 'admin_tickets', pings: ['refunds', 'higherstaff'] },  { id: 'partner', label: 'Partner',       emoji: '🤝', color: ButtonStyle.Success,   desc: 'server partnership proposals — Manager+', perm: 'ticket.manager', queue: 'partner', category: 'admin_tickets', pings: ['higherstaff'] },];const TOPIC = Object.fromEntries(TICKET_TOPICS.map(o => [o.id, o.label]));const TOPIC_PERM = Object.fromEntries(TICKET_TOPICS.map(o => [o.id, o.perm]));// role ids at-or-above a permission level (drives ticket channel overwrites dynamically)const LEVEL_ROLE_KEY = { HELPER: 'helper', MOD: 'mod', SR_MOD: 'srmod', JR_ADMIN: 'jradmin', ADMIN: 'admin', MANAGER: 'manager' };function rolesAtLevel(levelName) {  const keys = ['helper', 'mod', 'srmod', 'jradmin', 'admin', 'manager'];  const start = keys.indexOf(LEVEL_ROLE_KEY[levelName]);  if (start === -1) return [];  const map = config.staffRoleIds || {};  return keys.slice(start).map((k) => map[k]).filter(Boolean);}// resolve configured ping-role keys (from ticketPingRoles + staffGroupRoles) to role idsfunction pingRoleIds(topic) {  if (!topic?.pings?.length) return [];  const pr = config.ticketPingRoles || {};  const sg = config.staffGroupRoles || {};  const out = [];  for (const key of topic.pings) {    const id = pr[key] || sg[key];    if (id) out.push(id);  }  return out;}const perms = require('./permissions');const PANEL_EMBED = () =>  new EmbedBuilder()    .setColor(0x5865f2)    .setTitle('CoreMC - Support')    .setDescription(      [        '**Need help? Open a ticket below.**',        '',        'Pick the option that fits your issue and a private ticket will be created.',        '',        ...TICKET_TOPICS.map((o) => `${o.emoji} **${o.label}** — ${o.desc}`),        '',        '⚠️ Abuse of the ticket system will result in punishment.',      ].join('\n')    )    .setFooter({ text: 'CoreMC • Support Team' })    .setTimestamp();function panelButtons() {  const rows = [];  for (let i = 0; i < TICKET_TOPICS.length; i += 3) {    rows.push(      new ActionRowBuilder().addComponents(        ...TICKET_TOPICS.slice(i, i + 3).map((o) =>          new ButtonBuilder()            .setCustomId(`ticket_open_${o.id}`)            .setLabel(o.label)            .setEmoji(o.emoji)            .setStyle(o.color)        )      )    );  }  return rows;}// ---------------------------------------------------------------- clientconst FULL_INTENTS = [  GatewayIntentBits.Guilds,  GatewayIntentBits.GuildMembers,  GatewayIntentBits.GuildMessages,  GatewayIntentBits.MessageContent,  GatewayIntentBits.GuildInvites,];const MIN_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildInvites];let client = new Client({ intents: FULL_INTENTS, partials: [Partials.Channel] });global.client = client;const openTickets = new Map();const pendingCloseRequests = new Set();const state = { botTag: null, degraded: [] };function isStaffMember(member) {  if (!member) return false;  return (    member.permissions?.has?.(PermissionFlagsBits.Administrator) ||    (config.supportRoleId && member.roles?.cache?.has(config.supportRoleId))  );}async async async async function bindEvents(c) {  c.once('ready', () => {    state.botTag = c.user.tag;    console.log(`[CoreMC] Logged in as ${c.user.tag}`);    c.user.setActivity('CoreMC', { type: 3 });    const xp = require('./xp');    const invites = require('./invites');    const giveaways = require('./giveaways');    global.syncChatRoles = async (member, level) => {      const entries = Object.entries(config.chatLevelRoleIds || {})        .map(([lvl, rid]) => ({ lvl: Number(lvl), rid }))        .filter((e) => e.rid);      if (!entries.length) return;      const owned = entries.filter((e) => e.lvl <= level).map((e) => e.rid);      const drop = entries.map((e) => e.rid).filter((rid) => !owned.includes(rid));      const add = owned.filter((rid) => !member.roles.cache.has(rid));      if (drop.length) await member.roles.remove(drop, 'Chat level change').catch(() => {});      if (add.length) await member.roles.add(add, `Reached chat level ${level}`).catch(() => {});    };    global.syncKeyRoles = async (userId) => {      const guild = c.guilds.cache.get(config.guildId);      if (!guild) return;      const member = await guild.members.fetch(userId).catch(() => null);      if (!member) return;      const tiers = config.inviteRewards || [];      const n = invites.invitesOf(userId);      const ownedRoleIds = tiers.filter((t) => t.roleId && n >= t.invites).map((t) => t.roleId);      const allRoleIds = tiers.map((t) => t.roleId).filter(Boolean);      const drop = allRoleIds.filter((rid) => !ownedRoleIds.includes(rid));      const add = ownedRoleIds.filter((rid) => !member.roles.cache.has(rid));      if (drop.length) await member.roles.remove(drop, 'Invite tier change').catch(() => {});      if (add.length) await member.roles.add(add, `Invite tier reached (${n} invites)`).catch(() => {});    };    invites.refreshGuildInvites(c.guilds.cache.get(config.guildId)).catch(() => {});    for (const msgId of Object.keys(require('./db').load('giveaways', {}))) giveaways.scheduleDraw(msgId);    // --- "bump" helper: delete the pinned brand embed and resend it first.    const { inviteRewardsEmbed, boosterRewardsEmbed } = require('./embed');    async function bump(channelId, makeEmbed) {      const ch = c.channels.cache.get(channelId);      if (!ch) return;      // find our brand embed (footer text starts with "CoreMC •")      const msgs = await ch.messages.fetch({ limit: 50 }).catch(() => null);      if (msgs) {        for (const m of msgs.values()) {          if (m.author.id === c.user.id && m.embeds[0]?.footer?.text?.startsWith('CoreMC')) {            await m.delete().catch(() => {});            break;          }        }      }      await ch.send({ embeds: [makeEmbed()] }).catch(() => {});    }    global.bumpInviteRewards = () => bump(config.inviteRewardsChannelId, inviteRewardsEmbed);    global.bumpBoosterRewards = () => bump(config.boosterRewardsChannelId, boosterRewardsEmbed);    // resend the rewards embed on top when someone boosts  });  c.on('messageCreate', async (message) => {    try {      await require('./xp').handleMessage(message);    } catch (err) {      console.error('[xp]', err.message);    }  });  c.on('guildMemberAdd', async (member) => {  
-    try {      await require('./xp').handleMessage(message);    } catch (err) {      console.error('[xp]', err.message);    }  });
-
+// CoreMC - Support — tickets, chat XP rewards, invite keys, welcome, giveaways
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  PermissionFlagsBits,
+  ChannelType,
+  OverwriteType,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} = require("discord.js"); // ---------------------------------------------------------------- config
+const cfgPath = path.join(__dirname, "config.json");
+function loadConfig() {
+  const defaults = {
+    token: "",
+    clientId: "",
+    guildId: "",
+    supportRoleId: "",
+    categoryId: "",
+    logChannelId: "",
+    panelChannelId: "",
+    welcomeChannelId: "",
+    chatRewardsChannelId: "",
+    rulesChannelId: "",
+    notesChannelId: "",
+    giveawayChannelId: "",
+    chatLevelRoleIds: {}, // { "5": roleId, "10": roleId }
+    inviteRewards: [], // [{ invites: 3, roleId, label }]
+  };
+  try {
+    return { ...defaults, ...JSON.parse(fs.readFileSync(cfgPath, "utf8")) };
+  } catch {
+    return defaults;
+  }
+}
+let config = loadConfig();
+const missingCreds = ["token", "clientId", "guildId"].filter((k) => !config[k]);
+global.cfg = config; // ---------------------------------------------------------------- panels
+const TICKET_TOPICS = [
+  {
+    id: "general",
+    label: "General Support",
+    emoji: "❓",
+    color: ButtonStyle.Primary,
+    desc: "questions & help — handled by Helper+",
+    perm: "ticket.general_support",
+    queue: "general_support",
+    category: "general_support",
+    pings: ["jrstaff"],
+  },
+  {
+    id: "manager",
+    label: "Manager Support",
+    emoji: "👑",
+    color: ButtonStyle.Success,
+    desc: "management & escalations — Managers only",
+    perm: "ticket.manager",
+    queue: "manager",
+    category: "manager",
+    pings: ["higherstaff"],
+  },
+  {
+    id: "media",
+    label: "Media",
+    emoji: "🎥",
+    color: ButtonStyle.Secondary,
+    desc: "content creator & media requests",
+    perm: "ticket.media",
+    queue: "media",
+    category: "staff",
+    pings: ["media"],
+  },
+  {
+    id: "appeals",
+    label: "Punishment Appeal",
+    emoji: "⚖️",
+    color: ButtonStyle.Danger,
+    desc: "contest a punishment — Junior Admin+",
+    perm: "ticket.punishment_appeal",
+    queue: "punishment_appeal",
+    category: "admin_tickets",
+    pings: ["punishments", "higherstaff"],
+  },
+  {
+    id: "refunds",
+    label: "Refunds",
+    emoji: "💸",
+    color: ButtonStyle.Primary,
+    desc: "purchase & store issues — Junior Admin+",
+    perm: "ticket.refunds",
+    queue: "refunds",
+    category: "admin_tickets",
+    pings: ["refunds", "higherstaff"],
+  },
+  {
+    id: "partner",
+    label: "Partner",
+    emoji: "🤝",
+    color: ButtonStyle.Success,
+    desc: "server partnership proposals — Manager+",
+    perm: "ticket.manager",
+    queue: "partner",
+    category: "admin_tickets",
+    pings: ["higherstaff"],
+  },
+];
+const TOPIC = Object.fromEntries(TICKET_TOPICS.map((o) => [o.id, o.label]));
+const TOPIC_PERM = Object.fromEntries(TICKET_TOPICS.map((o) => [o.id, o.perm])); // role ids at-or-above a permission level (drives ticket channel overwrites dynamically)
+const LEVEL_ROLE_KEY = {
+  HELPER: "helper",
+  MOD: "mod",
+  SR_MOD: "srmod",
+  JR_ADMIN: "jradmin",
+  ADMIN: "admin",
+  MANAGER: "manager",
+};
+function rolesAtLevel(levelName) {
+  const keys = ["helper", "mod", "srmod", "jradmin", "admin", "manager"];
+  const start = keys.indexOf(LEVEL_ROLE_KEY[levelName]);
+  if (start === -1) return [];
+  const map = config.staffRoleIds || {};
+  return keys
+    .slice(start)
+    .map((k) => map[k])
+    .filter(Boolean);
+} // resolve configured ping-role keys (from ticketPingRoles + staffGroupRoles) to role ids
+function pingRoleIds(topic) {
+  if (!topic?.pings?.length) return [];
+  const pr = config.ticketPingRoles || {};
+  const sg = config.staffGroupRoles || {};
+  const out = [];
+  for (const key of topic.pings) {
+    const id = pr[key] || sg[key];
+    if (id) out.push(id);
+  }
+  return out;
+}
+const perms = require("./permissions");
+const PANEL_EMBED = () =>
+  new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("CoreMC - Support")
+    .setDescription(
+      [
+        "**Need help? Open a ticket below.**",
+        "",
+        "Pick the option that fits your issue and a private ticket will be created.",
+        "",
+        ...TICKET_TOPICS.map((o) => `${o.emoji} **${o.label}** — ${o.desc}`),
+        "",
+        "⚠️ Abuse of the ticket system will result in punishment.",
+      ].join("\n"),
+    )
+    .setFooter({ text: "CoreMC • Support Team" })
+    .setTimestamp();
+function panelButtons() {
+  const rows = [];
+  for (let i = 0; i < TICKET_TOPICS.length; i += 3) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        ...TICKET_TOPICS.slice(i, i + 3).map((o) =>
+          new ButtonBuilder()
+            .setCustomId(`ticket_open_${o.id}`)
+            .setLabel(o.label)
+            .setEmoji(o.emoji)
+            .setStyle(o.color),
+        ),
+      ),
+    );
+  }
+  return rows;
+} // ---------------------------------------------------------------- client
+const FULL_INTENTS = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildInvites,
+];
+const MIN_INTENTS = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildInvites,
+];
+let client = new Client({
+  intents: FULL_INTENTS,
+  partials: [Partials.Channel],
+});
+global.client = client;
+const openTickets = new Map();
+const pendingCloseRequests = new Set();
+const state = { botTag: null, degraded: [] };
+function isStaffMember(member) {
+  if (!member) return false;
+  return (
+    member.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    (config.supportRoleId && member.roles?.cache?.has(config.supportRoleId))
+  );
+}
+async function bindEvents(c) {
+  c.once("ready", () => {
+    state.botTag = c.user.tag;
+    console.log(`[CoreMC] Logged in as ${c.user.tag}`);
+    c.user.setActivity("CoreMC", { type: 3 });
+    const xp = require("./xp");
+    const invites = require("./invites");
+    const giveaways = require("./giveaways");
+    global.syncChatRoles = async (member, level) => {
+      const entries = Object.entries(config.chatLevelRoleIds || {})
+        .map(([lvl, rid]) => ({ lvl: Number(lvl), rid }))
+        .filter((e) => e.rid);
+      if (!entries.length) return;
+      const owned = entries.filter((e) => e.lvl <= level).map((e) => e.rid);
+      const drop = entries
+        .map((e) => e.rid)
+        .filter((rid) => !owned.includes(rid));
+      const add = owned.filter((rid) => !member.roles.cache.has(rid));
+      if (drop.length)
+        await member.roles.remove(drop, "Chat level change").catch(() => {});
+      if (add.length)
+        await member.roles
+          .add(add, `Reached chat level ${level}`)
+          .catch(() => {});
+    };
+    global.syncKeyRoles = async (userId) => {
+      const guild = c.guilds.cache.get(config.guildId);
+      if (!guild) return;
+      const member = await guild.members.fetch(userId).catch(() => null);
+      if (!member) return;
+      const tiers = config.inviteRewards || [];
+      const n = invites.invitesOf(userId);
+      const ownedRoleIds = tiers
+        .filter((t) => t.roleId && n >= t.invites)
+        .map((t) => t.roleId);
+      const allRoleIds = tiers.map((t) => t.roleId).filter(Boolean);
+      const drop = allRoleIds.filter((rid) => !ownedRoleIds.includes(rid));
+      const add = ownedRoleIds.filter((rid) => !member.roles.cache.has(rid));
+      if (drop.length)
+        await member.roles.remove(drop, "Invite tier change").catch(() => {});
+      if (add.length)
+        await member.roles
+          .add(add, `Invite tier reached (${n} invites)`)
+          .catch(() => {});
+    };
+    invites
+      .refreshGuildInvites(c.guilds.cache.get(config.guildId))
+      .catch(() => {});
+    for (const msgId of Object.keys(require("./db").load("giveaways", {})))
+      giveaways.scheduleDraw(msgId); // --- "bump" helper: delete the pinned brand embed and resend it first.
+    const { inviteRewardsEmbed, boosterRewardsEmbed } = require("./embed");
+    async function bump(channelId, makeEmbed) {
+      const ch = c.channels.cache.get(channelId);
+      if (!ch) return; // find our brand embed (footer text starts with "CoreMC •")
+      const msgs = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+      if (msgs) {
+        for (const m of msgs.values()) {
+          if (
+            m.author.id === c.user.id &&
+            m.embeds[0]?.footer?.text?.startsWith("CoreMC")
+          ) {
+            await m.delete().catch(() => {});
+            break;
+          }
+        }
       }
-      break;
+      await ch.send({ embeds: [makeEmbed()] }).catch(() => {});
+    }
+    global.bumpInviteRewards = () =>
+      bump(config.inviteRewardsChannelId, inviteRewardsEmbed);
+    global.bumpBoosterRewards = () =>
+      bump(config.boosterRewardsChannelId, boosterRewardsEmbed); // resend the rewards embed on top when someone boosts
+  });
+  c.on("messageCreate", async (message) => {
+    try {
+      await require("./xp").handleMessage(message);
+    } catch (err) {
+      console.error("[xp]", err.message);
     }
   });
-    const inviterId = await (async () => {      const guild = member.guild;
-      const inv = await guild.invites.fetch().catch(() => null);
-      if (!inv) return null;
-      for (const [code, i] of inv) {
-        if (i.user?.bot) continue;
-        if (i.uses === 0) continue;
-        const inviter = await member.guild.members.fetch(i.inviter?.id?.toString()).catch(() => null);
-        if (!inviter || inviter.id === member.id) continue;
-        // check if this was an invite created before the member joined
-        const createdAt = i.createdAt;
-        const joinedAt = member.joinedAt;
-        if (createdAt && joinedAt && createdAt > joinedAt) continue;
-        return i.inviter?.id;
+  c.on("guildMemberAdd", async (member) => {
+    try {
+      const invites = require("./invites");
+      const inviterId = await invites.onMemberAdd(member);
+      if (config.welcomeChannelId) {
+        const ch = member.guild.channels.cache.get(config.welcomeChannelId);
+        if (ch) {
+          const inviter = inviterId
+            ? await c.users.fetch(inviterId).catch(() => null)
+            : null;
+          const invitedLine =
+            inviter && inviter.id !== member.id
+              ? `was invited by **${inviter.username}**`
+              : "just joined the server";
+          const { buildWelcomeCard } = require("./welcome");
+          await ch.send(buildWelcomeCard(member, invitedLine)).catch(() => {});
+        }
+      } // invites feed
+      if (config.inviteRewardsChannelId) {
+        const invCh = member.guild.channels.cache.get(
+          config.inviteRewardsChannelId,
+        );
+        if (invCh) {
+          const inviter = inviterId
+            ? await c.users.fetch(inviterId).catch(() => null)
+            : null;
+          const invites = require("./invites");
+          const total = inviterId ? invites.invitesOf(inviterId) : 0;
+          if (inviter && inviter.id !== member.id) {
+            await invCh
+              .send(
+                `${member} was invited by ${inviter}. They now have ${total} invite${total === 1 ? "" : "s"}.`,
+              )
+              .catch(() => {});
+          } else {
+            await invCh
+              .send(`${member} joined without an invite link.`)
+              .catch(() => {});
+          } // keep the rewards embed pinned at the top
+          if (global.bumpInviteRewards)
+            await global.bumpInviteRewards().catch(() => {});
+        }
       }
-      return null;
-    })();
-
-    if (inviterId && counts[inviterId] > 0) {
-      counts[inviterId]--;
-      db.save('invites', counts);
-      if (global.syncKeyRoles) await global.syncKeyRoles(inviterId).catch(() => {});
+    } catch (err) {
+      console.error("[welcome]", err.message);
     }
-  });    try {      const invites = require('./invites');      const inviterId = await invites.onMemberAdd(member);      if (config.welcomeChannelId) {        const ch = member.guild.channels.cache.get(config.welcomeChannelId);        if (ch) {          const inviter = inviterId ? await c.users.fetch(inviterId).catch(() => null) : null;          const invitedLine =            inviter && inviter.id !== member.id ? `was invited by **${inviter.username}**` : 'just joined the server';          const { buildWelcomeCard } = require('./welcome');          await ch.send(buildWelcomeCard(member, invitedLine)).catch(() => {});        }      }      // invites feed      if (config.inviteRewardsChannelId) {        const invCh = member.guild.channels.cache.get(config.inviteRewardsChannelId);        if (invCh) {          const inviter = inviterId ? await c.users.fetch(inviterId).catch(() => null) : null;          const invites = require('./invites');          const total = inviterId ? invites.invitesOf(inviterId) : 0;          if (inviter && inviter.id !== member.id) {            await invCh.send(`${member} was invited by ${inviter}. They now have ${total} invite${total === 1 ? '' : 's'}.`).catch(() => {});          } else {            await invCh.send(`${member} joined without an invite link.`).catch(() => {});          }          // keep the rewards embed pinned at the top          if (global.bumpInviteRewards) await global.bumpInviteRewards().catch(() => {});        }      }    } catch (err) {      console.error('[welcome]', err.message);    }  });  c.on('inviteDelete', () => {    require('./invites').refreshGuildInvites(c.guilds.cache.get(config.guildId)).catch(() => {});  });  c.on('guildCreate', (guild) => {    require('./invites').refreshGuildInvites(guild).catch(() => {});  });  c.on('interactionCreate', async (interaction) => {    try {      if (interaction.isChatInputCommand()) {        const MOD_CMDS = ['warn', 'mute', 'unmute', 'kick', 'ban', 'punishments', 'stafflist', 'promote', 'demote', 'setpermission'];        if (MOD_CMDS.includes(interaction.commandName)) {          return require('./moderation').handle(interaction);        }        switch (interaction.commandName) {          case 'tickets-panel': {            await interaction.channel.send({ embeds: [PANEL_EMBED()], components: panelButtons() });            return interaction.reply({ content: '✅ Panel posted.', ephemeral: true });          }          case 'rank': {            const r = require('./xp').rankOf(interaction.user.id);            return interaction.reply(              r                ? `📊 **${interaction.user.username}** — Level **${r.level}** • ${r.xp} XP • ${r.nextIn} XP to next level`                : `You haven't earned any XP yet — start chatting! (+${require('./xp').XP_PER_MESSAGE} XP per message)`            );          }          case 'top': {            const rows = require('./xp').top(10);            if (!rows.length) return interaction.reply('No one has chatted yet.');            const lines = rows.map((u, i) => `\`${String(i + 1).padStart(2)}.\` <@${u.id}> — Level ${u.level} • ${u.xp} XP`);            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🏆 Chat Rewards — Top Chatters').setDescription(lines.join('\n'))] });          }          case 'invites': {            const inv = require('./invites');            const n = inv.invitesOf(interaction.user.id);            const tier = inv.tierFor(n);            const next = (config.inviteRewards || []).find((t) => t.invites > n);            let txt = `📨 You have **${n}** invite${n === 1 ? '' : 's'} — current key: **${tier ? tier.label : 'none'}**`;            if (next) txt += `\n🎯 ${next.invites - n} more invite${next.invites - n === 1 ? '' : 's'} for **${next.label}**`;            return interaction.reply(txt);          }          case 'giveaway': {            return require('./giveaways').startWizard(interaction);          }          case 'partner_agree': {            // DM the user with the ad embed and collect member count            const user = interaction.user;            const guild = user.guild;            const { EmbedBuilder } = require('discord.js');            const adEmbed = new EmbedBuilder()              .setColor(0x5865f2)              .setTitle('🤝 Server Partnership — Advertise')              .setDescription(`Please advertise our server in your Discord.\n\n` +                `Our current member count: **${config.adChannelId ? 'configured' : '?' }**\n` +                `Our member requirements: **${config.minMemberCount || '?' }**+ members\n\n` +                'After posting, click the button below to submit proof.')            // send DM            try {              await user.send({ embeds: [adEmbed] });            } catch {              return interaction.reply({ content: '❌ Could not DM you. Please enable DMs from server members.', ephemeral: true }).catch(() => {});            }            // add reactions/collect proof later — for now just acknowledge            return interaction.reply({ content: "✅ I've DMd you the partnership requirements. Please post an ad in your server and submit a screenshot.", ephemeral: true }).catch(() => {});          }          case 'partner_disagree': {            return interaction.reply({ content: '❌ Partnership proposal cancelled.', ephemeral: true }).catch(() => {});          }          case 'note': {                      // Staff-only command — check permission                      if (!require('./permissions').can(interaction.member, 'notes.view')) {                        return interaction.reply({ content: '❌ You need **notes.view** permission to use this command.', ephemeral: true }).catch(() => {});                      }                      const userOpt = interaction.options.getUser('user');                      const userId = userOpt ? userOpt.id : interaction.options.getString('user');                      // allow raw ID string too                      const noteContent = interaction.options.getString('note');                      const list = interaction.options.getBoolean('list');                      const remove = interaction.options.getBoolean('remove');                      const noteidOpt = interaction.options.getString('noteid');                      // Validate userId                      if (!userId || isNaN(userId)) {                        return interaction.reply({ content: '❌ Invalid user ID.', ephemeral: true }).catch(() => {});                      }                      if (remove) {                        const removed = await notes.removeNote({ userId, noteId: noteidOpt, staffId: interaction.member.id, staffUsername: interaction.member.user.tag });                        if (!removed) {                          return interaction.reply({ content: `❌ Note \`${noteidOpt || '?'}\` not found for user ${userId}.`, ephemeral: true }).catch(() => {});                        }                        // log removal in #player-notes                        const { EmbedBuilder } = require('discord.js');                        const createNotesChannel = async () => {                          const guild = interaction.guild;                          let ch = guild.channels.cache.get('player-notes-channel-id');                          if (!ch) {                            ch = await guild.channels.create({                              name: 'player-notes',                              type: 0, // text                              topic: 'Staff-only player notes. Staff permissions required to view/post.',                              permissionOverwrites: [                                { id: guild.roles.everyone, deny: [0x00000800] }, // view channel denied for @everyone                                { id: global.cfg.staffRoleIds?.helper || '', allow: [0x00000800] }                              ]                            });                            global.cfg.staffRoleIds = global.cfg.staffRoleIds || {};                            global.cfg.staffRoleIds.playerNotesChannelId = ch.id;                          }                          // post removal embed                          const emb = new EmbedBuilder()                            .setColor(0xed4245)                            .setTitle('🗑 Note Removed')                            .addFields(                              { name: 'Note ID', value: `\`${removed.id}\``, inline: true },                              { name: 'User', value: `<@${removed.userId}> (${removed.username})`, inline: true },                              { name: 'Removed by', value: `<@${interaction.member.id}>`, inline: true },                              { name: 'Reason', value: 'Staff removed via /note remove' }                            )                            .setTimestamp();                          await ch.send({ embeds: [emb] });                        };                        await createNotesChannel();                        return interaction.reply({ content: `✅ Note \`${removed.id}\` removed for <@${userId}> by ${interaction.member}.`, ephemeral: true }).catch(() => {});                      }                      if (list) {                        const n = notes.notesOf(userId);                        return interaction.reply({ embeds: [notes.listNotesEmbed(userId, n.length ? n[0].username : 'User', n)], ephemeral: true }).catch(() => {});                      }                      // add note                      if (noteContent === null || noteContent === undefined) {                        return interaction.reply({ content: '❌ Note content required. Use `/note add <user> <note>`.', ephemeral: true }).catch(() => {});                      }                      // generate note ID                      const noteId = `N-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2).toUpperCase()}`;                      const entry = await notes.addNote({ userId, username: userOpt?.tag ?? userOpt?.username ?? String(userId), noteId, content: noteContent, staffId: interaction.member.id, staffUsername: interaction.member.user.tag });                      // log in #player-notes                      const { EmbedBuilder } = require('discord.js');                      const createNotesChannel = async () => {                        const guild = interaction.guild;                        let ch = guild.channels.cache.get('player-notes-channel-id');                        if (!ch) {                          ch = await guild.channels.create({                            name: 'player-notes',                            type: 0,                            topic: 'Staff-only player notes. Staff permissions required to view/post.',                            permissionOverwrites: [                              { id: guild.roles.everyone, deny: [0x00000800] },                              { id: global.cfg.staffRoleIds?.helper || '', allow: [0x00000800] }                            ]                          });                          global.cfg.staffRoleIds = global.cfg.staffRoleIds || {};                          global.cfg.staffRoleIds.playerNotesChannelId = ch.id;                        }                        const emb = new EmbedBuilder()                          .setColor(0x5865f2)                          .setTitle('📝 New Note')                          .addFields(                            { name: 'Note ID', value: `\`${entry.id}\``, inline: true },                            { name: 'User', value: `<@${entry.userId}> (${entry.username})`, inline: true },                            { name: 'Staff', value: `<@${entry.staffId}>`, inline: true },                            { name: 'Content', value: entry.content, inline: false }                          )                          .setTimestamp();                        await ch.send({ embeds: [emb] });                      };                      await createNotesChannel();                      return interaction.reply({ content: `✅ Note \`${entry.id}\` added for <@${userId}> by ${interaction.member}. Logged in #player-notes.`, ephemeral: true }).catch(() => {});                    }          case 'applications-panel': {            return require('./applications').startPanel(interaction);          }        }      }      if (interaction.isButton()) {        if (interaction.customId.startsWith('gw_')) {          return require('./giveaways').onButton(interaction);        }        if (interaction.customId.startsWith('ticket_open_')) {          return createTicket(interaction, interaction.customId.replace('ticket_open_', ''));        }        if (interaction.customId.startsWith('ticket_close_')) return handleCloseButton(interaction);        if (interaction.customId.startsWith('ticket_approve_')) return resolveCloseRequest(interaction, true);        if (interaction.customId.startsWith('ticket_deny_')) return resolveCloseRequest(interaction, false);        if (interaction.customId.startsWith('ticket_claim_')) return claimTicket(interaction);        if (interaction.customId.startsWith('app_apply_')) return require('./applications').onApplyButton(interaction, interaction.customId.replace('app_apply_', ''));        if (interaction.customId.startsWith('appsec_')) return require('./applications').onSectionButton(interaction, interaction.customId.replace('appsec_', ''));        if (interaction.customId.startsWith('appverdict_')) return require('./applications').onVerdictButton(interaction);      }      if (interaction.isModalSubmit()) {        if (interaction.customId === 'gw_modal') return require('./giveaways').handleModal(interaction);        if (interaction.customId.startsWith('ticket_closemodal_')) return completeStaffClose(interaction);        if (interaction.customId.startsWith('appmodal_')) return require('./applications').onSectionModal(interaction, interaction.customId.replace('appmodal_', ''));      }    } catch (err) {      console.error('[CoreMC] interaction error:', err);      if (interaction.isRepliable() && !interaction.replied) {        await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }).catch(() => {});      }    }  });}// ---------------------------------------------------------------- commandsasync function registerCommands() {  const mod = require('./moderation');const notes = require('./notes');  const commands = [    new SlashCommandBuilder()      .setName('tickets-panel')      .setDescription('Post the CoreMC - Support tickets panel in this channel')      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),    new SlashCommandBuilder().setName('rank').setDescription('Show your chat level and XP'),    new SlashCommandBuilder().setName('top').setDescription('Top chatters this season'),    new SlashCommandBuilder().setName('invites').setDescription('Show your invites and key tier'),    new SlashCommandBuilder()      .setName('giveaway')      .setDescription('Start a giveaway wizard (staff)')      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),    new SlashCommandBuilder()      .setName('note')      .setDescription('Staff: add, list, or remove a player note')      .addUserOption((opt) =>        opt.setName('user').setDescription('Discord user or user ID').setRequired(true)      )      .addStringOption((opt) =>        opt.setName('note').setDescription('Note content (for /note add)').setRequired(false)      )      .addBooleanOption((opt) =>        opt.setName('list').setDescription('List notes for the user').setRequired(false)      )      .addBooleanOption((opt) =>        opt.setName('remove').setDescription('Remove a note by ID').setRequired(false)      )      .addStringOption((opt) =>        opt.setName('noteid').setDescription('Note ID to remove').setRequired(false)      )      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),    new SlashCommandBuilder()      .setName('applications-panel')      .setDescription('Post the staff applications panel in this channel')      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),    ...mod.commands,  ].map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c));  const rest = new REST({ version: '10' }).setToken(config.token);  // global registration so the bot can be added to ANY server (not just config.guildId)  await rest.put(Routes.applicationCommands(config.clientId), { body: commands });  console.log('[CoreMC] Slash commands registered.');}// ------------------------------------------------------------ ticket helpersfunction ticketName(user, topicId) {  const safe = user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'user';  return `ticket-${topicId}-${safe}`;}async function createTicket(interaction, topicId) {  const guild = interaction.guild;  const user = interaction.user;  const topic = TICKET_TOPICS.find((t) => t.id === topicId);  const label = topic ? topic.label : topicId;  const permKey = topic?.perm;  if (!permKey) return interaction.reply({ content: '❌ Unknown ticket type.', ephemeral: true });  if (!guild.members.me.permissions.has(PermissionFlagsBits.ManageChannels)) {    return interaction.reply({ content: '❌ I need **Manage Channels** to create tickets.', ephemeral: true });  }  // queue + category this topic routes to  const queueId = config.ticketQueues?.[topic.queue];  const categoryId = config.ticketCategoryIds?.[topic.category] || config.categoryId;    // PARTNER TOPIC SPECIAL FLOW ---  if (topicId === 'partner') {    // send the partner requirements DM first    const { EmbedBuilder } = require('discord.js');    const adDesc = 'Please advertise our server in your Discord.\n\n' +      'Our current member count: **' + (config.adChannelId ? 'configured' : '?') + '**\n' +      'Our member requirements: **' + (config.minMemberCount || '?') + '+ members\n\n' +      'After posting, click Agree below to submit proof.';    const adEmbed = new EmbedBuilder()      .setColor(0x5865f2)      .setTitle('🤝 Server Partnership — Advertise')      .setDescription(adDesc);    try {      await interaction.user.send({ embeds: [adEmbed] });    } catch {      return interaction.reply({ content: '❌ Could not DM you. Please enable DMs.', ephemeral: true }).catch(() => {});    }    // create the ticket channel    const overwrites = [      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },      { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },    ];    for (const rid of rolesAtLevel(perms.PERM(permKey))) {      overwrites.push({ id: rid, type: OverwriteType.Role, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] });    }    let channel;    try {      channel = await guild.channels.create({        name: ticketName(user, topicId),        type: ChannelType.GuildText,        parent: categoryId || null,        permissionOverwrites: overwrites,        reason: 'Partner ticket by ' + user.tag,      });    } catch (err) {      console.error('[CoreMC] partner channel create failed:', err.message);      return interaction.reply({ content: '❌ Could not create partner ticket.', ephemeral: true });    }    const mine = openTickets.get(user.id) || new Set();    mine.add(channel.id);    openTickets.set(user.id, mine);    // send the agreement embed + buttons    const agreeBtn = new ButtonBuilder()      .setCustomId('partner_agree')      .setLabel('Agree')      .setStyle(ButtonStyle.Success);    const disagreeBtn = new ButtonBuilder()      .setCustomId('partner_disagree')      .setLabel('Disagree')      .setStyle(ButtonStyle.Danger);    const row = new ActionRowBuilder().addComponents(agreeBtn, disagreeBtn);    const partnerWelcome = new EmbedBuilder()      .setColor(0x5865f2)      .setTitle('🤝 Server Partnership')      .setDescription("Partnership proposal opened")\n' +        'Please read the requirements DM you just received. Click **Agree** if you accept, or **Disagree** if not.')    await channel.send({ content: `<@${user.id}>`, embeds: [partnerWelcome], components: [row] });    await interaction.reply({ content: '✅ Partner ticket created. DM sent with requirements.', ephemeral: true });    return;  }  // --- END PARTNER TOPIC ---  // overwrites: user + bot + every role at/above the topic's required level  const overwrites = [    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },    { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },  ];  for (const rid of rolesAtLevel(perms.PERM(permKey))) {    overwrites.push({ id: rid, type: OverwriteType.Role, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] });  }  let channel;  try {    channel = await guild.channels.create({      name: ticketName(user, topicId),      type: ChannelType.GuildText,      parent: categoryId || null,      permissionOverwrites: overwrites,      reason: `Support ticket (${label}) by ${user.tag}`,    });  } catch (err) {    console.error('[CoreMC] channel create failed:', err.message);    return interaction.reply({ content: '❌ Could not create your ticket. Contact a staff member.', ephemeral: true });  }  const mine = openTickets.get(user.id) || new Set();  mine.add(channel.id);  openTickets.set(user.id, mine);  const pings = pingRoleIds(topic);  const contentLine = [pings.map((id) => `<@&${id}>`).join(' '), `${user}`].filter(Boolean).join(' ');  const embed = new EmbedBuilder()    .setColor(topicId === 'manager' ? 0xe67e22 : 0x57f287)    .setTitle(label)    .setDescription(      [        `Hey ${user}, welcome to your ticket.`,        '',        'Describe your issue in as much detail as possible',        '(screenshots / clips help a lot). The team will be with you shortly.',      ].join('\n')    )    .addFields(      { name: 'Opened by', value: `${user}`, inline: true },      { name: 'Category', value: label, inline: true },      { name: 'Handled by', value: `@${perms.rankName(perms.L[perms.PERM(permKey)])}+`, inline: true }    )    .setFooter({ text: 'CoreMC • Support' })    .setTimestamp();  const closeLevelNeeded = topicId === 'general' ? 'ticket.close_general' : 'ticket.close_sensitive';  const row = new ActionRowBuilder().addComponents(    new ButtonBuilder().setCustomId(`ticket_close_${channel.id}`).setLabel('Close Ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger),    new ButtonBuilder().setCustomId(`ticket_claim_${channel.id}`).setLabel('Claim').setEmoji('🙋').setStyle(ButtonStyle.Success)  );  await channel.send({ content: contentLine, embeds: [embed], components: [row] });  await interaction.reply({ content: `✅ Your ticket is ready: ${channel}`, ephemeral: true });  // notify the staff queue  if (queueId) {    const q = guild.channels.cache.get(queueId);    if (q) {      const pingLine = pings.length ? pings.map((id) => `<@&${id}>`).join(' ') + '\n' : '';      q.send({        content: pingLine,        embeds: [new EmbedBuilder()          .setColor(0xfee75c)          .setTitle(`📥 New ticket — ${label}`)          .setDescription(`${channel} opened by ${user}`)          .addFields({ name: 'Required rank', value: `@${perms.rankName(perms.L[perms.PERM(permKey)])}+`, inline: true })          .setTimestamp()],      }).catch(() => {});    }  }  perms.log({    title: '🎫 Ticket opened',    fields: [      { name: 'User', value: user.tag, inline: true },      { name: 'Category', value: label, inline: true },      { name: 'Channel', value: `${channel}`, inline: true },    ],    color: 'info',  });  await ticketLog({    title: '🎫 Ticket opened',    fields: [      { name: 'User', value: user.tag, inline: true },      { name: 'Category', value: label, inline: true },      { name: 'Channel', value: `${channel}`, inline: true },    ],    color: 'info',  });}function topicPermForChannel(channel) {  // channel name format: ticket-<topicId>-<name>  const m = /^ticket-([a-z_]+)-/.exec(channel.name || '');  if (!m) return null;  return TOPIC_PERM[m[1]] || null;}// --- close flow -------------------------------------------------------async function handleCloseButton(interaction) {  const channel = interaction.channel;  const permKey = topicPermForChannel(channel) || 'ticket.general_support';  if (perms.can(interaction.member, permKey)) {    const modal = new ModalBuilder()      .setCustomId(`ticket_closemodal_${channel.id}`)      .setTitle('Close Ticket');    modal.addComponents(      new ActionRowBuilder().addComponents(        new TextInputBuilder()          .setCustomId('close_reason')          .setLabel('Reason for closing')          .setStyle(TextInputStyle.Paragraph)          .setRequired(true)          .setMaxLength(1000)      )    );    return interaction.showModal(modal);  }  if (pendingCloseRequests.has(channel.id)) {    return interaction.reply({ content: '⏳ A close request is already waiting for staff approval.', ephemeral: true });  }  pendingCloseRequests.add(channel.id);  const row = new ActionRowBuilder().addComponents(    new ButtonBuilder().setCustomId(`ticket_approve_${channel.id}`).setLabel('Approve Close').setEmoji('✅').setStyle(ButtonStyle.Success),    new ButtonBuilder().setCustomId(`ticket_deny_${channel.id}`).setLabel('Deny').setEmoji('✖️').setStyle(ButtonStyle.Danger)  );  await channel.send({    embeds: [new EmbedBuilder().setColor(0xfee75c).setDescription(`${interaction.user} requested to close the ticket.`).setTimestamp()],    components: [row],  });  return interaction.reply({ content: '✅ Close request sent — staff will review it.', ephemeral: true });}async function resolveCloseRequest(interaction, approved) {  const channel = interaction.channel;  const permKey = topicPermForChannel(channel) || 'ticket.general_support';  if (!perms.can(interaction.member, permKey)) {    return interaction.reply({ content: `❌ Only **${perms.rankName(perms.L[perms.PERM(permKey)])}+** can respond to close requests here.`, ephemeral: true });  }  if (!pendingCloseRequests.has(channel.id)) {    return interaction.reply({ content: 'This close request was already handled.', ephemeral: true });  }  pendingCloseRequests.delete(channel.id);  try {    const row = ActionRowBuilder.from(interaction.message.components[0]);    row.components.forEach((cmp) => cmp.setDisabled(true));    await interaction.message.edit({ components: [row] });  } catch {}      if (!approved) {      // Check if this is a partner ticket      const nameMatch = channel.name.match(/^ticket-partner-/);      if (nameMatch) {        // This is a partner ticket - verify proof          const partnerEmbed = new EmbedBuilder()            .setColor(0x5865f2)            .setTitle('🤝 Partnership Proof Verification')            .addFields({ name: 'Proof Submitted', value: interaction.customId.includes('partner_verify_yes') ? '✅ Approved' : '❌ Denied' }, { name: 'Verified by', value: `<@${interaction.member.id}>`, inline: true })            .setTimestamp();          await channel.send({ embeds: [partnerEmbed] });          // Determine action          const actionBtnRow = new ActionRowBuilder().addComponents(            new ButtonBuilder().setCustomId('partner_verify_yes').setLabel('Yes ✅').setStyle(ButtonStyle.Success),            new ButtonBuilder().setCustomId('partner_verify_no').setLabel('No ❌').setStyle(ButtonStyle.Danger)          );          await channel.send({ embeds: [partnerEmbed], components: [actionBtnRow] });          return interaction.deferUpdate();        }      if (!approved) {        await channel.send({          embeds: [new EmbedBuilder().setColor(0xed4245).setDescription(`❌ ${interaction.user} denied the close request. Ticket stays open.`)],        });        return interaction.deferUpdate();      }  await interaction.update({    embeds: [new EmbedBuilder().setColor(0x57f287).setDescription(`✅ Close request approved by ${interaction.user}.`)],    components: [],  });  await destroyTicket(channel, { approvedBy: interaction.user });}async function completeStaffClose(interaction) {  const reason = interaction.fields.getTextInputValue('close_reason');  const channel =    interaction.guild.channels.cache.get(interaction.customId.replace('ticket_closemodal_', '')) ||    interaction.channel;  await interaction.reply({    embeds: [new EmbedBuilder().setColor(0xed4245).setDescription(`🔒 ${interaction.user} closed this ticket.\n**Reason:** ${reason}`)],  });  await destroyTicket(channel, { closedBy: interaction.user, reason });}async function destroyTicket(channel, { closedBy = null, approvedBy = null, reason = null } = {}) {  for (const [uid, set] of openTickets) {    set.delete(channel.id);    if (!set.size) openTickets.delete(uid);  }  pendingCloseRequests.delete(channel.id);  const fields = [{ name: 'Channel', value: `#${channel.name}`, inline: true }];  if (closedBy) fields.push({ name: 'Closed by', value: closedBy.tag ?? String(closedBy), inline: true });  if (approvedBy) fields.push({ name: 'Approved by', value: approvedBy.tag ?? String(approvedBy), inline: true });  if (reason) fields.push({ name: 'Reason', value: reason });  perms.log({ title: '🔒 Ticket closed', fields, color: 'punish' });  await ticketLog({ title: '🔒 Ticket closed', fields, color: 'punish' });  // DM the ticket opener that their ticket was closed  try {    const ownerId = [...openTickets.entries()].find(([, set]) => set.has(channel.id))?.[0];    const target = ownerId || channel.permissionOverwrites?.cache?.find((o) => o.type === 1)?.id;    // derive the ticket label from the channel name (ticket-<topicId>-<user>)    const nameMatch = channel.name.match(/^ticket-([a-z_]+)-/);    const topicOf = nameMatch ? TICKET_TOPICS.find((t) => t.id === nameMatch[1]) : null;    const label = topicOf ? topicOf.label : (nameMatch ? nameMatch[1] : 'support');    if (target && target !== client.user.id) {      const u = await client.users.fetch(target).catch(() => null);      if (u) {        await u.send({          embeds: [            new EmbedBuilder()              .setColor(0x57f287)              .setTitle('🔒 Your CoreMC ticket was closed')              .setDescription(                `Your **${label}** ticket (\`${channel.name}\`) has been closed.` +                (reason ? `\n\n**Reason:** ${reason}` : '') +                `\n\nIf you still need help, open a new ticket from the Support panel.`              )              .setFooter({ text: 'CoreMC • Support Team' })              .setTimestamp(),          ],        }).catch(() => {});      }    }  } catch (e) {    console.error('[ticket] close DM failed:', e.message);  }  setTimeout(    () => channel.delete(`Ticket closed${closedBy ? ` by ${closedBy.tag}` : ''}${reason ? ` — ${reason.slice(0, 100)}` : ''}`).catch(() => {}),    4000  );}async function claimTicket(interaction) {  const channel = interaction.channel;  const permKey = topicPermForChannel(channel) || 'ticket.general_support';  if (!perms.can(interaction.member, permKey)) {    return interaction.reply({ content: `❌ Requires **${perms.rankName(perms.L[perms.PERM(permKey)])}+** to handle this ticket type.`, ephemeral: true });  }  await interaction.reply({    embeds: [new EmbedBuilder().setColor(0xfee75c).setDescription(`🙋 Ticket claimed by ${interaction.user} — they will be assisting you.`)],  }).catch(() => {});  perms.log({    title: '🙋 Ticket claimed',    fields: [      { name: 'Channel', value: `#${channel.name}`, inline: true },      { name: 'Claimed by', value: `${interaction.user}`, inline: true },    ],    color: 'info',  });  await ticketLog({    title: '🙋 Ticket claimed',    fields: [      { name: 'Channel', value: `#${channel.name}`, inline: true },      { name: 'Claimed by', value: `${interaction.user}`, inline: true },    ],    color: 'info',  });  try {    const row = ActionRowBuilder.from(interaction.message.components.find(r => r.components.some(c => c.data.custom_id?.startsWith('ticket_claim_'))) || interaction.message.components[0]);    row.components.forEach((cmp) => {      if (cmp.data.custom_id === `ticket_claim_${channel.id}`) cmp.setDisabled(true);    });    await interaction.message.edit({ components: [row] });  } catch {}}function logEmbed(title, fields, color) {  perms.log({ title, fields, color });}// ticket activity goes to a dedicated ticket-log channel (NOT the staff log)const TICKET_LOG_COLORS = { action: 0xfee75c, punish: 0xed4245, good: 0x57f287, info: 0x5865f2 };async function ticketLog({ title, fields = [], color = 'action' }) {  try {    const chId = global.cfg?.ticketLogChannelId;    if (!chId) return;    const ch = global.client?.channels?.cache?.get(chId);    if (!ch) return;    const emb = new EmbedBuilder()      .setColor(typeof color === 'string' ? TICKET_LOG_COLORS[color] : color)      .setTitle(title)      .addFields(fields.length ? fields : [{ name: '​', value: '​' }])      .setTimestamp();    await ch.send({ embeds: [emb] });  } catch (e) {    console.error('[ticketLog] failed:', e.message);  }}// ------------------------------------------------------------ health & selftestfunction assertPanelIntegrity() {  const rows = panelButtons();  const btns = rows.flatMap((r) => r.components.map((c) => c.data));  if (btns.length !== TICKET_TOPICS.length) throw new Error(`button count ${btns.length} != ${TICKET_TOPICS.length}`);  if (new Set(btns.map((b) => b.custom_id)).size !== TICKET_TOPICS.length) throw new Error('duplicate custom_id');  if (PANEL_EMBED().data.title !== 'CoreMC - Support') throw new Error('bad panel title');  const xp = require('./xp');  const invites = require('./invites');  const giveaways = require('./giveaways');  const welcome = require('./welcome');  if (typeof xp.handleMessage !== 'function' || xp.XP_PER_MESSAGE !== 5) throw new Error('xp module broken');  if (typeof invites.onMemberAdd !== 'function' || typeof invites.tierFor !== 'function') throw new Error('invites module broken');  if (typeof giveaways.startWizard !== 'function' || typeof giveaways.onButton !== 'function') throw new Error('giveaways module broken');  if (typeof welcome.buildWelcomeCard !== 'function') throw new Error('welcome module broken');  if (!fs.existsSync(path.join(__dirname, 'assets', 'coremc-welcome.png'))) throw new Error('welcome banner missing');  if (!Array.isArray(config.inviteRewards) || !config.inviteRewards.length) throw new Error('inviteRewards unconfigured');  if (!Object.keys(config.chatLevelRoleIds || {}).length) throw new Error('chatLevelRoleIds unconfigured');  const apps = require('./applications');  if (typeof apps.startPanel !== 'function' || typeof apps.onVerdictButton !== 'function') throw new Error('applications module broken');  for (const key of ['staffCategoryId', 'staffGuideChannelId', 'staffChatChannelId', 'reviewAppsChannelId', 'applicationsChannelId']) {    if (!config[key]) throw new Error(`${key} unconfigured`);  }  const sr = config.staffRoleIds || {};  for (const rk of ['helper', 'mod', 'srmod', 'jradmin', 'admin', 'manager', 'owner']) {    if (!sr[rk]) throw new Error(`staffRoleIds.${rk} unconfigured`);  }  for (const q of ['general_support', 'media', 'punishment_appeal', 'refunds', 'manager']) {    if (!config.ticketQueues?.[q]) throw new Error(`ticketQueues.${q} unconfigured`);  }  if (!config.staffLogChannelId) throw new Error('staffLogChannelId unconfigured');  if (!config.ticketLogChannelId) throw new Error('ticketLogChannelId unconfigured');  const pr = config.ticketPingRoles || {};  const sg = config.staffGroupRoles || {};  for (const k of ['refunds', 'punishments', 'media']) if (!pr[k]) throw new Error(`ticketPingRoles.${k} unconfigured`);  for (const k of ['jrstaff', 'higherstaff']) if (!sg[k]) throw new Error(`staffGroupRoles.${k} unconfigured`);  const permsMod = require('./permissions');  // permission engine checks  if (permsMod.L.HELPER !== 1 || permsMod.L.MANAGER !== 6) throw new Error('level table broken');  if (permsMod.PERM('ticket.general_support') !== 'HELPER') throw new Error('perm default wrong');  if (permsMod.PERM('ticket.punishment_appeal') !== 'JR_ADMIN') throw new Error('perm default wrong');  if (permsMod.PERM('ticket.refunds') !== 'JR_ADMIN') throw new Error('perm default wrong');  if (permsMod.PERM('application.final_decision') !== 'ADMIN') throw new Error('perm default wrong');  const fakeMember = (roleIds, admin = false) => ({    roles: { cache: { has: (rid) => roleIds.includes(rid) } },    permissions: { has: () => admin },  });  const ids = config.staffRoleIds;  if (permsMod.levelOf(fakeMember([ids.helper])) < permsMod.L.HELPER) throw new Error('helper level fail');  if (!(permsMod.levelOf(fakeMember([ids.manager])) > permsMod.levelOf(fakeMember([ids.admin])))) throw new Error('manager>admin fail');  if (permsMod.can(fakeMember([ids.srmod]), 'ticket.punishment_appeal')) throw new Error('srmod should NOT handle appeals');  if (!permsMod.can(fakeMember([ids.jradmin]), 'ticket.punishment_appeal')) throw new Error('jradmin appeal access fail');  if (permsMod.can(fakeMember([ids.jradmin]), 'ticket.manager')) throw new Error('jradm should NOT see manager tickets');  if (!permsMod.can(fakeMember([ids.manager]), 'ticket.manager')) throw new Error('manager tickets fail');  if (permsMod.can(fakeMember([ids.helper]), 'application.final_decision')) throw new Error('helper verdict fail');  if (!permsMod.can(fakeMember([ids.admin]), 'application.final_decision')) throw new Error('admin verdict fail');  // group roles map into the hierarchy correctly  if (permsMod.levelOf(fakeMember([sg.jrstaff])) < permsMod.L.SR_MOD) throw new Error('jrstaff should be >= SR_MOD');  if (permsMod.levelOf(fakeMember([sg.higherstaff])) < permsMod.L.JR_ADMIN) throw new Error('higherstaff should be >= JR_ADMIN');  if (!permsMod.can(fakeMember([sg.jrstaff]), 'ticket.general_support')) throw new Error('jrstaff general ticket fail');  if (permsMod.can(fakeMember([sg.jrstaff]), 'ticket.punishment_appeal')) throw new Error('jrstaff should NOT see appeals');  if (!permsMod.can(fakeMember([sg.higherstaff]), 'ticket.punishment_appeal')) throw new Error('higherstaff appeal access fail');  return `${btns.length} buttons / ${rows.length} rows + modules OK`;}function healthPayload() {  return {    service: 'coremc-support',    status: state.botTag ? 'online' : missingCreds.length ? 'unconfigured' : 'starting',    bot: state.botTag,    degraded: state.degraded,    panel: { options: TICKET_TOPICS.map((o) => o.label) },    uptime_s: Math.round(process.uptime()),  };}function startHealthServer(port = Number(process.env.PORT) || Number(process.env.SERVER_PORT) || 8000) {  const srv = http.createServer((req, res) => {    res.writeHead(200, { 'content-type': 'application/json' });    res.end(JSON.stringify(healthPayload()));  });  srv.on('error', (err) => {    if (err.code === 'EADDRINUSE' && port < 8010) {      console.warn(`[CoreMC] port ${port} busy, trying ${port + 1}`);      startHealthServer(port + 1);    } else {      console.error('[CoreMC] health server error:', err.message);    }  });  srv.listen(port, '0.0.0.0', () => console.log(`[CoreMC] health endpoint on :${port}`));  return srv;}// ------------------------------------------------------------ boot(async () => {  if (process.argv.includes('--selftest')) {    console.log(`[CoreMC] selftest OK — ${assertPanelIntegrity()}, missingCreds: [${missingCreds.join(', ')}]`);    process.exit(0);  }  try {    console.log(`[CoreMC] integrity OK (${assertPanelIntegrity()})`);  } catch (err) {    console.error('[CoreMC] INTEGRITY FAIL:', err.message);    process.exit(1);  }  startHealthServer();  if (missingCreds.length) {    console.warn(`[CoreMC] Missing config: ${missingCreds.join(', ')} — Discord login skipped.`);    return;  }  try {    await registerCommands();  } catch (err) {    console.error('[CoreMC] command registration failed:', err.message);  }  bindEvents(client);  try {    await client.login(config.token);  } catch (err) {    if (/disallowed intents|privileged intent/i.test(err.message)) {      state.degraded.push('privileged intents disabled in dev portal (XP/welcome limited)');      console.warn('[CoreMC] Privileged intents rejected — retrying with minimal intents on a fresh client.');      client.destroy().catch(() => {});      client = new Client({ intents: MIN_INTENTS, partials: [Partials.Channel] });      global.client = client;      bindEvents(client);      try {        await client.login(config.token);        console.warn('[CoreMC] ONLINE (degraded): enable Server Members + Message Content intents in the dev portal for XP/welcome.');      } catch (e2) {        console.error('[CoreMC] login failed:', e2.message);      }    } else {      console.error('[CoreMC] Discord login failed:', err.message);    }  }})();
+  });
+  c.on("inviteDelete", () => {
+    require("./invites")
+      .refreshGuildInvites(c.guilds.cache.get(config.guildId))
+      .catch(() => {});
+  });
+  c.on("guildCreate", (guild) => {
+    require("./invites")
+      .refreshGuildInvites(guild)
+      .catch(() => {});
+  });
+  c.on("interactionCreate", async (interaction) => {
+    try {
+      if (interaction.isChatInputCommand()) {
+        const MOD_CMDS = [
+          "warn",
+          "mute",
+          "unmute",
+          "kick",
+          "ban",
+          "punishments",
+          "stafflist",
+          "promote",
+          "demote",
+          "setpermission",
+        ];
+        if (MOD_CMDS.includes(interaction.commandName)) {
+          return require("./moderation").handle(interaction);
+        }
+        switch (interaction.commandName) {
+          case "tickets-panel": {
+            await interaction.channel.send({
+              embeds: [PANEL_EMBED()],
+              components: panelButtons(),
+            });
+            return interaction.reply({
+              content: "✅ Panel posted.",
+              ephemeral: true,
+            });
+          }
+          case "rank": {
+            const r = require("./xp").rankOf(interaction.user.id);
+            return interaction.reply(
+              r
+                ? `📊 **${interaction.user.username}** — Level **${r.level}** • ${r.xp} XP • ${r.nextIn} XP to next level`
+                : `You haven't earned any XP yet — start chatting! (+${require("./xp").XP_PER_MESSAGE} XP per message)`,
+            );
+          }
+          case "top": {
+            const rows = require("./xp").top(10);
+            if (!rows.length)
+              return interaction.reply("No one has chatted yet.");
+            const lines = rows.map(
+              (u, i) =>
+                `\`${String(i + 1).padStart(2)}.\` <@${u.id}> — Level ${u.level} • ${u.xp} XP`,
+            );
+            return interaction.reply({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0x5865f2)
+                  .setTitle("🏆 Chat Rewards — Top Chatters")
+                  .setDescription(lines.join("\n")),
+              ],
+            });
+          }
+          case "invites": {
+            const inv = require("./invites");
+            const n = inv.invitesOf(interaction.user.id);
+            const tier = inv.tierFor(n);
+            const next = (config.inviteRewards || []).find(
+              (t) => t.invites > n,
+            );
+            let txt = `📨 You have **${n}** invite${n === 1 ? "" : "s"} — current key: **${tier ? tier.label : "none"}**`;
+            if (next)
+              txt += `\n🎯 ${next.invites - n} more invite${next.invites - n === 1 ? "" : "s"} for **${next.label}**`;
+            return interaction.reply(txt);
+          }
+          case "giveaway": {
+            return require("./giveaways").startWizard(interaction);
+          }
+          case "partner_agree": {
+            // DM the user with the ad embed and collect member count
+            const user = interaction.user;
+            const guild = user.guild;
+            const { EmbedBuilder } = require("discord.js");
+            const adEmbed = new EmbedBuilder()
+              .setColor(0x5865f2)
+              .setTitle("🤝 Server Partnership — Advertise")
+              .setDescription(
+                `Please advertise our server in your Discord.\n\n` +
+                  `Our current member count: **${config.adChannelId ? "configured" : "?"}**\n` +
+                  `Our member requirements: **${config.minMemberCount || "?"}**+ members\n\n` +
+                  "After posting, click the button below to submit proof.",
+              ); // send DM
+            try {
+              await user.send({ embeds: [adEmbed] });
+            } catch {
+              return interaction
+                .reply({
+                  content:
+                    "❌ Could not DM you. Please enable DMs from server members.",
+                  ephemeral: true,
+                })
+                .catch(() => {});
+            } // add reactions/collect proof later — for now just acknowledge
+            return interaction
+              .reply({
+                content:
+                  "✅ I've DMd you the partnership requirements. Please post an ad in your server and submit a screenshot.",
+                ephemeral: true,
+              })
+              .catch(() => {});
+          }
+          case "partner_disagree": {
+            return interaction
+              .reply({
+                content: "❌ Partnership proposal cancelled.",
+                ephemeral: true,
+              })
+              .catch(() => {});
+          }
+          case "note": {
+            // Staff-only command — check permission
+            if (
+              !require("./permissions").can(interaction.member, "notes.view")
+            ) {
+              return interaction
+                .reply({
+                  content:
+                    "❌ You need **notes.view** permission to use this command.",
+                  ephemeral: true,
+                })
+                .catch(() => {});
+            }
+            const userOpt = interaction.options.getUser("user");
+            const userId = userOpt
+              ? userOpt.id
+              : interaction.options.getString("user"); // allow raw ID string too
+            const noteContent = interaction.options.getString("note");
+            const list = interaction.options.getBoolean("list");
+            const remove = interaction.options.getBoolean("remove");
+            const noteidOpt = interaction.options.getString("noteid"); // Validate userId
+            if (!userId || isNaN(userId)) {
+              return interaction
+                .reply({ content: "❌ Invalid user ID.", ephemeral: true })
+                .catch(() => {});
+            }
+            if (remove) {
+              const removed = await notes.removeNote({
+                userId,
+                noteId: noteidOpt,
+                staffId: interaction.member.id,
+                staffUsername: interaction.member.user.tag,
+              });
+              if (!removed) {
+                return interaction
+                  .reply({
+                    content: `❌ Note \`${noteidOpt || "?"}\` not found for user ${userId}.`,
+                    ephemeral: true,
+                  })
+                  .catch(() => {});
+              } // log removal in #player-notes
+              const { EmbedBuilder } = require("discord.js");
+              const createNotesChannel = async () => {
+                const guild = interaction.guild;
+                let ch = guild.channels.cache.get(config.notesChannelId);
+                if (!ch) {
+                  ch = await guild.channels.create({
+                    name: "player-notes",
+                    type: 0, // text
+                    topic:
+                      "Staff-only player notes. Staff permissions required to view/post.",
+                    permissionOverwrites: [
+                      { id: guild.roles.everyone, deny: [0x00000800] }, // view channel denied for @everyone
+                      {
+                        id: global.cfg.staffRoleIds?.helper || "",
+                        allow: [0x00000800],
+                      },
+                    ],
+                  });
+                  global.cfg.staffRoleIds = global.cfg.staffRoleIds || {};
+                  global.cfg.staffRoleIds.playerNotesChannelId = ch.id;
+                } // post removal embed
+                const emb = new EmbedBuilder()
+                  .setColor(0xed4245)
+                  .setTitle("🗑 Note Removed")
+                  .addFields(
+                    {
+                      name: "Note ID",
+                      value: `\`${removed.id}\``,
+                      inline: true,
+                    },
+                    {
+                      name: "User",
+                      value: `<@${removed.userId}> (${removed.username})`,
+                      inline: true,
+                    },
+                    {
+                      name: "Removed by",
+                      value: `<@${interaction.member.id}>`,
+                      inline: true,
+                    },
+                    { name: "Reason", value: "Staff removed via /note remove" },
+                  )
+                  .setTimestamp();
+                await ch.send({ embeds: [emb] });
+              };
+              await createNotesChannel();
+              return interaction
+                .reply({
+                  content: `✅ Note \`${removed.id}\` removed for <@${userId}> by ${interaction.member}.`,
+                  ephemeral: true,
+                })
+                .catch(() => {});
+            }
+            if (list) {
+              const n = notes.notesOf(userId);
+              return interaction
+                .reply({
+                  embeds: [
+                    notes.listNotesEmbed(
+                      userId,
+                      n.length ? n[0].username : "User",
+                      n,
+                    ),
+                  ],
+                  ephemeral: true,
+                })
+                .catch(() => {});
+            } // add note
+            if (noteContent === null || noteContent === undefined) {
+              return interaction
+                .reply({
+                  content:
+                    "❌ Note content required. Use `/note add <user> <note>`.",
+                  ephemeral: true,
+                })
+                .catch(() => {});
+            } // generate note ID
+            const noteId = `N-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2).toUpperCase()}`;
+            const entry = await notes.addNote({
+              userId,
+              username: userOpt?.tag ?? userOpt?.username ?? String(userId),
+              noteId,
+              content: noteContent,
+              staffId: interaction.member.id,
+              staffUsername: interaction.member.user.tag,
+            }); // log in #player-notes
+            const { EmbedBuilder } = require("discord.js");
+            const createNotesChannel = async () => {
+              const guild = interaction.guild;
+              let ch = guild.channels.cache.get(config.notesChannelId);
+              if (!ch) {
+                ch = await guild.channels.create({
+                  name: "player-notes",
+                  type: 0,
+                  topic:
+                    "Staff-only player notes. Staff permissions required to view/post.",
+                  permissionOverwrites: [
+                    { id: guild.roles.everyone, deny: [0x00000800] },
+                    {
+                      id: global.cfg.staffRoleIds?.helper || "",
+                      allow: [0x00000800],
+                    },
+                  ],
+                });
+                global.cfg.staffRoleIds = global.cfg.staffRoleIds || {};
+                global.cfg.staffRoleIds.playerNotesChannelId = ch.id;
+              }
+              const emb = new EmbedBuilder()
+                .setColor(0x5865f2)
+                .setTitle("📝 New Note")
+                .addFields(
+                  { name: "Note ID", value: `\`${entry.id}\``, inline: true },
+                  {
+                    name: "User",
+                    value: `<@${entry.userId}> (${entry.username})`,
+                    inline: true,
+                  },
+                  { name: "Staff", value: `<@${entry.staffId}>`, inline: true },
+                  { name: "Content", value: entry.content, inline: false },
+                )
+                .setTimestamp();
+              await ch.send({ embeds: [emb] });
+            };
+            await createNotesChannel();
+            return interaction
+              .reply({
+                content: `✅ Note \`${entry.id}\` added for <@${userId}> by ${interaction.member}. Logged in #player-notes.`,
+                ephemeral: true,
+              })
+              .catch(() => {});
+          }
+          case "applications-panel": {
+            return require("./applications").startPanel(interaction);
+          }
+        }
+      }
+      if (interaction.isButton()) {
+        if (interaction.customId.startsWith("gw_")) {
+          return require("./giveaways").onButton(interaction);
+        }
+        if (interaction.customId.startsWith("ticket_open_")) {
+          return createTicket(
+            interaction,
+            interaction.customId.replace("ticket_open_", ""),
+          );
+        }
+        if (interaction.customId.startsWith("ticket_close_"))
+          return handleCloseButton(interaction);
+        if (interaction.customId.startsWith("ticket_approve_"))
+          return resolveCloseRequest(interaction, true);
+        if (interaction.customId.startsWith("ticket_deny_"))
+          return resolveCloseRequest(interaction, false);
+        if (interaction.customId.startsWith("ticket_claim_"))
+          return claimTicket(interaction);
+        if (interaction.customId.startsWith("app_apply_"))
+          return require("./applications").onApplyButton(
+            interaction,
+            interaction.customId.replace("app_apply_", ""),
+          );
+        if (interaction.customId.startsWith("appsec_"))
+          return require("./applications").onSectionButton(
+            interaction,
+            interaction.customId.replace("appsec_", ""),
+          );
+        if (interaction.customId.startsWith("appverdict_"))
+          return require("./applications").onVerdictButton(interaction);
+      }
+      if (interaction.isModalSubmit()) {
+        if (interaction.customId === "gw_modal")
+          return require("./giveaways").handleModal(interaction);
+        if (interaction.customId.startsWith("ticket_closemodal_"))
+          return completeStaffClose(interaction);
+        if (interaction.customId.startsWith("appmodal_"))
+          return require("./applications").onSectionModal(
+            interaction,
+            interaction.customId.replace("appmodal_", ""),
+          );
+      }
+    } catch (err) {
+      console.error("[CoreMC] interaction error:", err);
+      if (interaction.isRepliable() && !interaction.replied) {
+        await interaction
+          .reply({ content: "❌ Something went wrong.", ephemeral: true })
+          .catch(() => {});
+      }
+    }
+  });
+} // ---------------------------------------------------------------- commands
+async function registerCommands() {
+  const mod = require("./moderation");
+  const notes = require("./notes");
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("tickets-panel")
+      .setDescription("Post the CoreMC - Support tickets panel in this channel")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName("rank")
+      .setDescription("Show your chat level and XP"),
+    new SlashCommandBuilder()
+      .setName("top")
+      .setDescription("Top chatters this season"),
+    new SlashCommandBuilder()
+      .setName("invites")
+      .setDescription("Show your invites and key tier"),
+    new SlashCommandBuilder()
+      .setName("giveaway")
+      .setDescription("Start a giveaway wizard (staff)")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName("note")
+      .setDescription("Staff: add, list, or remove a player note")
+      .addUserOption((opt) =>
+        opt
+          .setName("user")
+          .setDescription("Discord user or user ID")
+          .setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("note")
+          .setDescription("Note content (for /note add)")
+          .setRequired(false),
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName("list")
+          .setDescription("List notes for the user")
+          .setRequired(false),
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName("remove")
+          .setDescription("Remove a note by ID")
+          .setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("noteid")
+          .setDescription("Note ID to remove")
+          .setRequired(false),
+      )
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName("applications-panel")
+      .setDescription("Post the staff applications panel in this channel")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    ...mod.commands,
+  ].map((c) => (typeof c.toJSON === "function" ? c.toJSON() : c));
+  const rest = new REST({ version: "10" }).setToken(config.token); // global registration so the bot can be added to ANY server (not just config.guildId)
+  await rest.put(Routes.applicationCommands(config.clientId), {
+    body: commands,
+  });
+  console.log("[CoreMC] Slash commands registered.");
+} // ------------------------------------------------------------ ticket helpers
+function ticketName(user, topicId) {
+  const safe =
+    user.username
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 12) || "user";
+  return `ticket-${topicId}-${safe}`;
+}
+async function createTicket(interaction, topicId) {
+  const guild = interaction.guild;
+  const user = interaction.user;
+  const topic = TICKET_TOPICS.find((t) => t.id === topicId);
+  const label = topic ? topic.label : topicId;
+  const permKey = topic?.perm;
+  if (!permKey)
+    return interaction.reply({
+      content: "❌ Unknown ticket type.",
+      ephemeral: true,
+    });
+  if (!guild.members.me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({
+      content: "❌ I need **Manage Channels** to create tickets.",
+      ephemeral: true,
+    });
+  } // queue + category this topic routes to
+  const queueId = config.ticketQueues?.[topic.queue];
+  const categoryId =
+    config.ticketCategoryIds?.[topic.category] || config.categoryId; // PARTNER TOPIC SPECIAL FLOW ---
+  if (topicId === "partner") {
+    // send the partner requirements DM first
+    const { EmbedBuilder } = require("discord.js");
+    const adDesc =
+      "Please advertise our server in your Discord.\n\n" +
+      "Our current member count: **" +
+      (config.adChannelId ? "configured" : "?") +
+      "**\n" +
+      "Our member requirements: **" +
+      (config.minMemberCount || "?") +
+      "+ members\n\n" +
+      "After posting, click Agree below to submit proof.";
+    const adEmbed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("🤝 Server Partnership — Advertise")
+      .setDescription(adDesc);
+    try {
+      await interaction.user.send({ embeds: [adEmbed] });
+    } catch {
+      return interaction
+        .reply({
+          content: "❌ Could not DM you. Please enable DMs.",
+          ephemeral: true,
+        })
+        .catch(() => {});
+    } // create the ticket channel
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      {
+        id: user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.AttachFiles,
+        ],
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ManageChannels,
+        ],
+      },
+    ];
+    for (const rid of rolesAtLevel(perms.PERM(permKey))) {
+      overwrites.push({
+        id: rid,
+        type: OverwriteType.Role,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.AttachFiles,
+        ],
+      });
+    }
+    let channel;
+    try {
+      channel = await guild.channels.create({
+        name: ticketName(user, topicId),
+        type: ChannelType.GuildText,
+        parent: categoryId || null,
+        permissionOverwrites: overwrites,
+        reason: "Partner ticket by " + user.tag,
+      });
+    } catch (err) {
+      console.error("[CoreMC] partner channel create failed:", err.message);
+      return interaction.reply({
+        content: "❌ Could not create partner ticket.",
+        ephemeral: true,
+      });
+    }
+    const mine = openTickets.get(user.id) || new Set();
+    mine.add(channel.id);
+    openTickets.set(user.id, mine); // send the agreement embed + buttons
+    const agreeBtn = new ButtonBuilder()
+      .setCustomId("partner_agree")
+      .setLabel("Agree")
+      .setStyle(ButtonStyle.Success);
+    const disagreeBtn = new ButtonBuilder()
+      .setCustomId("partner_disagree")
+      .setLabel("Disagree")
+      .setStyle(ButtonStyle.Danger);
+    const row = new ActionRowBuilder().addComponents(agreeBtn, disagreeBtn);
+    const partnerWelcome = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("🤝 Server Partnership")
+      .setDescription(
+        "Partnership proposal opened\n" +
+          "Please read the requirements DM you just received. Click **Agree** if you accept, or **Disagree** if not.",
+      );
+    await channel.send({
+      content: `<@${user.id}>`,
+      embeds: [partnerWelcome],
+      components: [row],
+    });
+    await interaction.reply({
+      content: "✅ Partner ticket created. DM sent with requirements.",
+      ephemeral: true,
+    });
+    return;
+  } // --- END PARTNER TOPIC ---
+  // overwrites: user + bot + every role at/above the topic's required level
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ManageChannels,
+      ],
+    },
+  ];
+  for (const rid of rolesAtLevel(perms.PERM(permKey))) {
+    overwrites.push({
+      id: rid,
+      type: OverwriteType.Role,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    });
+  }
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: ticketName(user, topicId),
+      type: ChannelType.GuildText,
+      parent: categoryId || null,
+      permissionOverwrites: overwrites,
+      reason: `Support ticket (${label}) by ${user.tag}`,
+    });
+  } catch (err) {
+    console.error("[CoreMC] channel create failed:", err.message);
+    return interaction.reply({
+      content: "❌ Could not create your ticket. Contact a staff member.",
+      ephemeral: true,
+    });
+  }
+  const mine = openTickets.get(user.id) || new Set();
+  mine.add(channel.id);
+  openTickets.set(user.id, mine);
+  const pings = pingRoleIds(topic);
+  const contentLine = [pings.map((id) => `<@&${id}>`).join(" "), `${user}`]
+    .filter(Boolean)
+    .join(" ");
+  const embed = new EmbedBuilder()
+    .setColor(topicId === "manager" ? 0xe67e22 : 0x57f287)
+    .setTitle(label)
+    .setDescription(
+      [
+        `Hey ${user}, welcome to your ticket.`,
+        "",
+        "Describe your issue in as much detail as possible",
+        "(screenshots / clips help a lot). The team will be with you shortly.",
+      ].join("\n"),
+    )
+    .addFields(
+      { name: "Opened by", value: `${user}`, inline: true },
+      { name: "Category", value: label, inline: true },
+      {
+        name: "Handled by",
+        value: `@${perms.rankName(perms.L[perms.PERM(permKey)])}+`,
+        inline: true,
+      },
+    )
+    .setFooter({ text: "CoreMC • Support" })
+    .setTimestamp();
+  const closeLevelNeeded =
+    topicId === "general" ? "ticket.close_general" : "ticket.close_sensitive";
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ticket_close_${channel.id}`)
+      .setLabel("Close Ticket")
+      .setEmoji("🔒")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`ticket_claim_${channel.id}`)
+      .setLabel("Claim")
+      .setEmoji("🙋")
+      .setStyle(ButtonStyle.Success),
+  );
+  await channel.send({
+    content: contentLine,
+    embeds: [embed],
+    components: [row],
+  });
+  await interaction.reply({
+    content: `✅ Your ticket is ready: ${channel}`,
+    ephemeral: true,
+  }); // notify the staff queue
+  if (queueId) {
+    const q = guild.channels.cache.get(queueId);
+    if (q) {
+      const pingLine = pings.length
+        ? pings.map((id) => `<@&${id}>`).join(" ") + "\n"
+        : "";
+      q.send({
+        content: pingLine,
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xfee75c)
+            .setTitle(`📥 New ticket — ${label}`)
+            .setDescription(`${channel} opened by ${user}`)
+            .addFields({
+              name: "Required rank",
+              value: `@${perms.rankName(perms.L[perms.PERM(permKey)])}+`,
+              inline: true,
+            })
+            .setTimestamp(),
+        ],
+      }).catch(() => {});
+    }
+  }
+  perms.log({
+    title: "🎫 Ticket opened",
+    fields: [
+      { name: "User", value: user.tag, inline: true },
+      { name: "Category", value: label, inline: true },
+      { name: "Channel", value: `${channel}`, inline: true },
+    ],
+    color: "info",
+  });
+  await ticketLog({
+    title: "🎫 Ticket opened",
+    fields: [
+      { name: "User", value: user.tag, inline: true },
+      { name: "Category", value: label, inline: true },
+      { name: "Channel", value: `${channel}`, inline: true },
+    ],
+    color: "info",
+  });
+}
+function topicPermForChannel(channel) {
+  // channel name format: ticket-<topicId>-<name>
+  const m = /^ticket-([a-z_]+)-/.exec(channel.name || "");
+  if (!m) return null;
+  return TOPIC_PERM[m[1]] || null;
+} // --- close flow -------------------------------------------------------
+async function handleCloseButton(interaction) {
+  const channel = interaction.channel;
+  const permKey = topicPermForChannel(channel) || "ticket.general_support";
+  if (perms.can(interaction.member, permKey)) {
+    const modal = new ModalBuilder()
+      .setCustomId(`ticket_closemodal_${channel.id}`)
+      .setTitle("Close Ticket");
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("close_reason")
+          .setLabel("Reason for closing")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1000),
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+  if (pendingCloseRequests.has(channel.id)) {
+    return interaction.reply({
+      content: "⏳ A close request is already waiting for staff approval.",
+      ephemeral: true,
+    });
+  }
+  pendingCloseRequests.add(channel.id);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ticket_approve_${channel.id}`)
+      .setLabel("Approve Close")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`ticket_deny_${channel.id}`)
+      .setLabel("Deny")
+      .setEmoji("✖️")
+      .setStyle(ButtonStyle.Danger),
+  );
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0xfee75c)
+        .setDescription(`${interaction.user} requested to close the ticket.`)
+        .setTimestamp(),
+    ],
+    components: [row],
+  });
+  return interaction.reply({
+    content: "✅ Close request sent — staff will review it.",
+    ephemeral: true,
+  });
+}
+async function resolveCloseRequest(interaction, approved) {
+  const channel = interaction.channel;
+  const permKey = topicPermForChannel(channel) || "ticket.general_support";
+  if (!perms.can(interaction.member, permKey)) {
+    return interaction.reply({
+      content: `❌ Only **${perms.rankName(perms.L[perms.PERM(permKey)])}+** can respond to close requests here.`,
+      ephemeral: true,
+    });
+  }
+  if (!pendingCloseRequests.has(channel.id)) {
+    return interaction.reply({
+      content: "This close request was already handled.",
+      ephemeral: true,
+    });
+  }
+  pendingCloseRequests.delete(channel.id);
+  try {
+    const row = ActionRowBuilder.from(interaction.message.components[0]);
+    row.components.forEach((cmp) => cmp.setDisabled(true));
+    await interaction.message.edit({ components: [row] });
+  } catch {} // Check if this is a partner ticket
+  const nameMatch = channel.name.match(/^ticket-partner-/);
+  if (nameMatch) {
+    // This is a partner ticket - verify proof
+    const partnerEmbed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("🤝 Partnership Proof Verification")
+      .addFields(
+        {
+          name: "Proof Submitted",
+          value: interaction.customId.includes("partner_verify_yes")
+            ? "✅ Approved"
+            : "❌ Denied",
+        },
+        {
+          name: "Verified by",
+          value: `<@${interaction.member.id}>`,
+          inline: true,
+        },
+      )
+      .setTimestamp();
+    await channel.send({ embeds: [partnerEmbed] }); // Determine action
+    const actionBtnRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("partner_verify_yes")
+        .setLabel("Yes ✅")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("partner_verify_no")
+        .setLabel("No ❌")
+        .setStyle(ButtonStyle.Danger),
+    );
+    await channel.send({ embeds: [partnerEmbed], components: [actionBtnRow] });
+    return interaction.deferUpdate();
+  }
+  if (!approved) {
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setDescription(
+            `❌ ${interaction.user} denied the close request. Ticket stays open.`,
+          ),
+      ],
+    });
+    return interaction.deferUpdate();
+  }
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x57f287)
+        .setDescription(`✅ Close request approved by ${interaction.user}.`),
+    ],
+    components: [],
+  });
+  await destroyTicket(channel, { approvedBy: interaction.user });
+}
+async function completeStaffClose(interaction) {
+  const reason = interaction.fields.getTextInputValue("close_reason");
+  const channel =
+    interaction.guild.channels.cache.get(
+      interaction.customId.replace("ticket_closemodal_", ""),
+    ) || interaction.channel;
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0xed4245)
+        .setDescription(
+          `🔒 ${interaction.user} closed this ticket.\n**Reason:** ${reason}`,
+        ),
+    ],
+  });
+  await destroyTicket(channel, { closedBy: interaction.user, reason });
+}
+async function destroyTicket(
+  channel,
+  { closedBy = null, approvedBy = null, reason = null } = {},
+) {
+  for (const [uid, set] of openTickets) {
+    set.delete(channel.id);
+    if (!set.size) openTickets.delete(uid);
+  }
+  pendingCloseRequests.delete(channel.id);
+  const fields = [{ name: "Channel", value: `#${channel.name}`, inline: true }];
+  if (closedBy)
+    fields.push({
+      name: "Closed by",
+      value: closedBy.tag ?? String(closedBy),
+      inline: true,
+    });
+  if (approvedBy)
+    fields.push({
+      name: "Approved by",
+      value: approvedBy.tag ?? String(approvedBy),
+      inline: true,
+    });
+  if (reason) fields.push({ name: "Reason", value: reason });
+  perms.log({ title: "🔒 Ticket closed", fields, color: "punish" });
+  await ticketLog({ title: "🔒 Ticket closed", fields, color: "punish" }); // DM the ticket opener that their ticket was closed
+  try {
+    const ownerId = [...openTickets.entries()].find(([, set]) =>
+      set.has(channel.id),
+    )?.[0];
+    const target =
+      ownerId ||
+      channel.permissionOverwrites?.cache?.find((o) => o.type === 1)?.id; // derive the ticket label from the channel name (ticket-<topicId>-<user>)
+    const nameMatch = channel.name.match(/^ticket-([a-z_]+)-/);
+    const topicOf = nameMatch
+      ? TICKET_TOPICS.find((t) => t.id === nameMatch[1])
+      : null;
+    const label = topicOf
+      ? topicOf.label
+      : nameMatch
+        ? nameMatch[1]
+        : "support";
+    if (target && target !== client.user.id) {
+      const u = await client.users.fetch(target).catch(() => null);
+      if (u) {
+        await u
+          .send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0x57f287)
+                .setTitle("🔒 Your CoreMC ticket was closed")
+                .setDescription(
+                  `Your **${label}** ticket (\`${channel.name}\`) has been closed.` +
+                    (reason ? `\n\n**Reason:** ${reason}` : "") +
+                    `\n\nIf you still need help, open a new ticket from the Support panel.`,
+                )
+                .setFooter({ text: "CoreMC • Support Team" })
+                .setTimestamp(),
+            ],
+          })
+          .catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error("[ticket] close DM failed:", e.message);
+  }
+  setTimeout(
+    () =>
+      channel
+        .delete(
+          `Ticket closed${closedBy ? ` by ${closedBy.tag}` : ""}${reason ? ` — ${reason.slice(0, 100)}` : ""}`,
+        )
+        .catch(() => {}),
+    4000,
+  );
+}
+async function claimTicket(interaction) {
+  const channel = interaction.channel;
+  const permKey = topicPermForChannel(channel) || "ticket.general_support";
+  if (!perms.can(interaction.member, permKey)) {
+    return interaction.reply({
+      content: `❌ Requires **${perms.rankName(perms.L[perms.PERM(permKey)])}+** to handle this ticket type.`,
+      ephemeral: true,
+    });
+  }
+  await interaction
+    .reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xfee75c)
+          .setDescription(
+            `🙋 Ticket claimed by ${interaction.user} — they will be assisting you.`,
+          ),
+      ],
+    })
+    .catch(() => {});
+  perms.log({
+    title: "🙋 Ticket claimed",
+    fields: [
+      { name: "Channel", value: `#${channel.name}`, inline: true },
+      { name: "Claimed by", value: `${interaction.user}`, inline: true },
+    ],
+    color: "info",
+  });
+  await ticketLog({
+    title: "🙋 Ticket claimed",
+    fields: [
+      { name: "Channel", value: `#${channel.name}`, inline: true },
+      { name: "Claimed by", value: `${interaction.user}`, inline: true },
+    ],
+    color: "info",
+  });
+  try {
+    const row = ActionRowBuilder.from(
+      interaction.message.components.find((r) =>
+        r.components.some((c) => c.data.custom_id?.startsWith("ticket_claim_")),
+      ) || interaction.message.components[0],
+    );
+    row.components.forEach((cmp) => {
+      if (cmp.data.custom_id === `ticket_claim_${channel.id}`)
+        cmp.setDisabled(true);
+    });
+    await interaction.message.edit({ components: [row] });
+  } catch {}
+}
+function logEmbed(title, fields, color) {
+  perms.log({ title, fields, color });
+} // ticket activity goes to a dedicated ticket-log channel (NOT the staff log)
+const TICKET_LOG_COLORS = {
+  action: 0xfee75c,
+  punish: 0xed4245,
+  good: 0x57f287,
+  info: 0x5865f2,
+};
+async function ticketLog({ title, fields = [], color = "action" }) {
+  try {
+    const chId = global.cfg?.ticketLogChannelId;
+    if (!chId) return;
+    const ch = global.client?.channels?.cache?.get(chId);
+    if (!ch) return;
+    const emb = new EmbedBuilder()
+      .setColor(typeof color === "string" ? TICKET_LOG_COLORS[color] : color)
+      .setTitle(title)
+      .addFields(fields.length ? fields : [{ name: "​", value: "​" }])
+      .setTimestamp();
+    await ch.send({ embeds: [emb] });
+  } catch (e) {
+    console.error("[ticketLog] failed:", e.message);
+  }
+} // ------------------------------------------------------------ health & selftest
+function assertPanelIntegrity() {
+  const rows = panelButtons();
+  const btns = rows.flatMap((r) => r.components.map((c) => c.data));
+  if (btns.length !== TICKET_TOPICS.length)
+    throw new Error(`button count ${btns.length} != ${TICKET_TOPICS.length}`);
+  if (new Set(btns.map((b) => b.custom_id)).size !== TICKET_TOPICS.length)
+    throw new Error("duplicate custom_id");
+  if (PANEL_EMBED().data.title !== "CoreMC - Support")
+    throw new Error("bad panel title");
+  const xp = require("./xp");
+  const invites = require("./invites");
+  const giveaways = require("./giveaways");
+  const welcome = require("./welcome");
+  if (typeof xp.handleMessage !== "function" || xp.XP_PER_MESSAGE !== 5)
+    throw new Error("xp module broken");
+  if (
+    typeof invites.onMemberAdd !== "function" ||
+    typeof invites.tierFor !== "function"
+  )
+    throw new Error("invites module broken");
+  if (
+    typeof giveaways.startWizard !== "function" ||
+    typeof giveaways.onButton !== "function"
+  )
+    throw new Error("giveaways module broken");
+  if (typeof welcome.buildWelcomeCard !== "function")
+    throw new Error("welcome module broken");
+  if (!fs.existsSync(path.join(__dirname, "assets", "coremc-welcome.png")))
+    throw new Error("welcome banner missing");
+  const apps = require("./applications");
+  if (
+    typeof apps.startPanel !== "function" ||
+    typeof apps.onVerdictButton !== "function"
+  )
+    throw new Error("applications module broken");
+  const permsMod = require("./permissions");
+  // permission-table defaults are config-independent
+  if (permsMod.L.HELPER !== 1 || permsMod.L.MANAGER !== 6)
+    throw new Error("level table broken");
+  if (permsMod.PERM("ticket.general_support") !== "HELPER")
+    throw new Error("perm default wrong");
+  if (permsMod.PERM("ticket.punishment_appeal") !== "JR_ADMIN")
+    throw new Error("perm default wrong");
+  if (permsMod.PERM("ticket.refunds") !== "JR_ADMIN")
+    throw new Error("perm default wrong");
+  if (permsMod.PERM("application.final_decision") !== "ADMIN")
+    throw new Error("perm default wrong");
+  // engine wiring checks run only when a staff map is actually configured
+  const ids = config.staffRoleIds || {};
+  const sg = config.staffGroupRoles || {};
+  if (
+    ids.helper && ids.mod && ids.srmod && ids.jradmin && ids.admin &&
+    ids.manager && sg.jrstaff && sg.higherstaff
+  ) {
+    const fakeMember = (roleIds, admin = false) => ({
+      roles: { cache: { has: (rid) => roleIds.includes(rid) } },
+      permissions: { has: () => admin },
+    });
+    if (permsMod.levelOf(fakeMember([ids.helper])) < permsMod.L.HELPER)
+      throw new Error("helper level fail");
+    if (!(permsMod.levelOf(fakeMember([ids.manager])) > permsMod.levelOf(fakeMember([ids.admin]))))
+      throw new Error("manager>admin fail");
+    if (permsMod.can(fakeMember([ids.srmod]), "ticket.punishment_appeal"))
+      throw new Error("srmod should NOT handle appeals");
+    if (!permsMod.can(fakeMember([ids.jradmin]), "ticket.punishment_appeal"))
+      throw new Error("jradmin appeal access fail");
+    if (permsMod.can(fakeMember([ids.jradmin]), "ticket.manager"))
+      throw new Error("jradm should NOT see manager tickets");
+    if (!permsMod.can(fakeMember([ids.manager]), "ticket.manager"))
+      throw new Error("manager tickets fail");
+    if (permsMod.can(fakeMember([ids.helper]), "application.final_decision"))
+      throw new Error("helper verdict fail");
+    if (!permsMod.can(fakeMember([ids.admin]), "application.final_decision"))
+      throw new Error("admin verdict fail");
+    if (permsMod.levelOf(fakeMember([sg.jrstaff])) < permsMod.L.SR_MOD)
+      throw new Error("jrstaff should be >= SR_MOD");
+    if (permsMod.levelOf(fakeMember([sg.higherstaff])) < permsMod.L.JR_ADMIN)
+      throw new Error("higherstaff should be >= JR_ADMIN");
+    if (!permsMod.can(fakeMember([sg.jrstaff]), "ticket.general_support"))
+      throw new Error("jrstaff general ticket fail");
+    if (permsMod.can(fakeMember([sg.jrstaff]), "ticket.punishment_appeal"))
+      throw new Error("jrstaff should NOT see appeals");
+    if (!permsMod.can(fakeMember([sg.higherstaff]), "ticket.punishment_appeal"))
+      throw new Error("higherstaff appeal access fail");
+  }
+  return `${btns.length} buttons / ${rows.length} rows + modules OK`;
+}
+
+// Config gaps no longer crash the bot. They switch the affected feature off and
+// are reported once at boot, so a slim config still boots tickets + moderation.
+function configIssues() {
+  const out = [];
+  const miss = (v, m) => { if (!v) out.push(m); };
+  miss(config.inviteRewards && config.inviteRewards.length, "inviteRewards empty (invite rewards off)");
+  miss(Object.keys(config.chatLevelRoleIds || {}).length, "chatLevelRoleIds empty (chat XP off)");
+  for (const key of ["staffCategoryId", "staffGuideChannelId", "staffChatChannelId", "reviewAppsChannelId", "applicationsChannelId"])
+    miss(config[key], `${key} not set`);
+  const sr = config.staffRoleIds || {};
+  for (const rk of ["helper", "mod", "srmod", "jradmin", "admin", "manager", "owner"])
+    miss(sr[rk], `staffRoleIds.${rk} not set`);
+  for (const q of ["general_support", "media", "punishment_appeal", "refunds", "manager"])
+    miss(config.ticketQueues && config.ticketQueues[q], `ticketQueues.${q} not set`);
+  miss(config.staffLogChannelId, "staffLogChannelId not set");
+  miss(config.ticketLogChannelId, "ticketLogChannelId not set");
+  const pr = config.ticketPingRoles || {};
+  const sg = config.staffGroupRoles || {};
+  for (const k of ["refunds", "punishments", "media"]) miss(pr[k], `ticketPingRoles.${k} not set`);
+  for (const k of ["jrstaff", "higherstaff"]) miss(sg[k], `staffGroupRoles.${k} not set`);
+  return out;
+}
+
+function healthPayload() {
+  return {
+    service: "coremc-support",
+    status: state.botTag
+      ? "online"
+      : missingCreds.length
+        ? "unconfigured"
+        : "starting",
+    bot: state.botTag,
+    degraded: state.degraded,
+    panel: { options: TICKET_TOPICS.map((o) => o.label) },
+    uptime_s: Math.round(process.uptime()),
+  };
+}
+function startHealthServer(
+  port = Number(process.env.PORT) || Number(process.env.SERVER_PORT) || 8000,
+) {
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(healthPayload()));
+  });
+  srv.on("error", (err) => {
+    if (err.code === "EADDRINUSE" && port < 8010) {
+      console.warn(`[CoreMC] port ${port} busy, trying ${port + 1}`);
+      startHealthServer(port + 1);
+    } else {
+      console.error("[CoreMC] health server error:", err.message);
+    }
+  });
+  srv.listen(port, "0.0.0.0", () =>
+    console.log(`[CoreMC] health endpoint on :${port}`),
+  );
+  return srv;
+} // ------------------------------------------------------------ boot
+(async () => {
+  if (process.argv.includes("--selftest")) {
+    console.log(
+      `[CoreMC] selftest OK — ${assertPanelIntegrity()}, missingCreds: [${missingCreds.join(", ")}]`,
+    );
+    process.exit(0);
+  }
+  try {
+    console.log(`[CoreMC] integrity OK (${assertPanelIntegrity()})`);
+  } catch (err) {
+    console.error("[CoreMC] INTEGRITY FAIL:", err.message);
+    process.exit(1);
+  }
+  const issues = configIssues();
+  if (issues.length)
+    console.warn("[CoreMC] running with reduced config: " + issues.join("; "));
+  startHealthServer();
+  if (missingCreds.length) {
+    console.warn(
+      `[CoreMC] Missing config: ${missingCreds.join(", ")} — Discord login skipped.`,
+    );
+    return;
+  }
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.error("[CoreMC] command registration failed:", err.message);
+  }
+  bindEvents(client);
+  try {
+    await client.login(config.token);
+  } catch (err) {
+    if (/disallowed intents|privileged intent/i.test(err.message)) {
+      state.degraded.push(
+        "privileged intents disabled in dev portal (XP/welcome limited)",
+      );
+      console.warn(
+        "[CoreMC] Privileged intents rejected — retrying with minimal intents on a fresh client.",
+      );
+      client.destroy().catch(() => {});
+      client = new Client({
+        intents: MIN_INTENTS,
+        partials: [Partials.Channel],
+      });
+      global.client = client;
+      bindEvents(client);
+      try {
+        await client.login(config.token);
+        console.warn(
+          "[CoreMC] ONLINE (degraded): enable Server Members + Message Content intents in the dev portal for XP/welcome.",
+        );
+      } catch (e2) {
+        console.error("[CoreMC] login failed:", e2.message);
+      }
+    } else {
+      console.error("[CoreMC] Discord login failed:", err.message);
+    }
+  }
+})();

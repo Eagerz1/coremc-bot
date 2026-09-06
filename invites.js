@@ -31,6 +31,7 @@ async function findInvoker(guild) {
 }
 
 async function onMemberAdd(member) {
+  if (!Array.isArray(global.cfg?.inviteRewards) || !global.cfg.inviteRewards.length) return null; // rewards disabled
   const inviterId = await findInvoker(member.guild);
   if (inviterId && inviterId !== member.id) {
     counts[inviterId] = (counts[inviterId] || 0) + 1;

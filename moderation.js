@@ -29,6 +29,24 @@ async function replyLog(interaction, title, description, color) {
   await interaction.reply({ embeds: [emb] });
 }
 
+async function dmPunish(target, { emoji, type, color, reason, staff, duration }) {
+  const emb = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`${emoji} ${type} — CoreMC`)
+    .setDescription(
+      [
+        `**Action:** ${type}`,
+        duration ? `**Duration:** ${duration}` : null,
+        `**Reason:** ${reason || 'No reason provided'}`,
+        `**Staff:** ${staff}`,
+        '',
+        'If you believe this is a mistake, open a **Punishment Appeal** ticket.',
+      ].filter(Boolean).join('\n')
+    )
+    .setTimestamp();
+  try { await target.send({ embeds: [emb] }).catch(() => {}); } catch {}
+}
+
 // ---------------------------------------------------------------- command defs
 const commands = [
   new SlashCommandBuilder()
@@ -89,7 +107,7 @@ async function handle(interaction) {
       const reason = interaction.options.getString('reason');
       const evidence = interaction.options.getString('evidence');
       const entry = await perms.recordPunishment({ type: 'Warning', tier: null, target, staff: interaction.user, reason, evidence });
-      try { await target.send(`⚠️ You received a warning on **CoreMC**.\n**Reason:** ${reason}`).catch(() => {}); } catch {}
+      await dmPunish(target, { emoji: '⚠️', type: 'Warning', color: 0xfee75c, reason, staff: interaction.user });
       return replyLog(interaction, `⚠️ Warning issued — ${entry.id}`, `${target} warned by ${interaction.user}\n**Reason:** ${reason}${evidence ? `\n**Evidence:** ${evidence}` : ''}`, 0xfee75c);
     }
 
@@ -103,6 +121,7 @@ async function handle(interaction) {
       if (!member) return interaction.reply({ content: '❌ Member not found in this server.', ephemeral: true });
       if (perms.levelOf(member) >= perms.levelOf(interaction.member)) return interaction.reply({ content: '❌ You cannot mute an equal or higher-ranked staff member.', ephemeral: true });
       await member.timeout(dur.ms, `${reason} (by ${interaction.user.tag})`);
+      await dmPunish(target, { emoji: '🔇', type: 'Mute', color: 0xfee75c, reason, staff: interaction.user, duration: dur.label });
       const entry = await perms.recordPunishment({ type: 'Mute', tier: null, target, staff: interaction.user, reason, duration: dur.label });
       return replyLog(interaction, `🔇 Muted — ${entry.id}`, `${target} muted for **${dur.label}** by ${interaction.user}\n**Reason:** ${reason}`, 0xfee75c);
     }
@@ -124,7 +143,7 @@ async function handle(interaction) {
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
       if (!member) return interaction.reply({ content: '❌ Member not found.', ephemeral: true });
       if (perms.levelOf(member) >= perms.levelOf(interaction.member)) return interaction.reply({ content: '❌ You cannot kick an equal or higher-ranked staff member.', ephemeral: true });
-      try { await target.send(`👢 You were kicked from **CoreMC**.\n**Reason:** ${reason}`).catch(() => {}); } catch {}
+      await dmPunish(target, { emoji: '👢', type: 'Kick', color: 0xed4245, reason, staff: interaction.user });
       await member.kick(`${reason} (by ${interaction.user.tag})`);
       const entry = await perms.recordPunishment({ type: 'Kick', tier: null, target, staff: interaction.user, reason });
       return replyLog(interaction, `👢 Kicked — ${entry.id}`, `${target} kicked by ${interaction.user}\n**Reason:** ${reason}`, 0xed4245);
@@ -139,7 +158,7 @@ async function handle(interaction) {
       if (member && perms.levelOf(member) >= perms.levelOf(interaction.member)) {
         return interaction.reply({ content: '❌ You cannot ban an equal or higher-ranked staff member.', ephemeral: true });
       }
-      try { await target.send(`🔨 You were banned from **CoreMC**.\n**Reason:** ${reason}`).catch(() => {}); } catch {}
+      await dmPunish(target, { emoji: '🔨', type: 'Ban', color: 0xed4245, reason, staff: interaction.user });
       await interaction.guild.members.ban(target.id, { days, reason: `${reason} (by ${interaction.user.tag})` }).catch(e => {
         throw new Error(`ban failed: ${e.message}`);
       });

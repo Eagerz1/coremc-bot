@@ -13,6 +13,7 @@ function levelFor(xp) {
 
 async function handleMessage(message) {
   if (message.author.bot || !message.guild) return;
+  if (!Object.keys(global.cfg?.chatLevelRoleIds || {}).length) return; // rewards disabled
   const u = users[message.author.id] || { xp: 0, lastMsg: 0 };
   const now = Date.now();
   if (now - (u.lastMsg || 0) < COOLDOWN_MS) return;

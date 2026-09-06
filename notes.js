@@ -3,9 +3,7 @@
 // All identifiers use Discord user IDs (permanent). Note content is sanitized to prevent mentions/pings.
 
 const { EmbedBuilder } = require('discord.js');
-const { permission: { can }, log } = require('./permissions');
 const { load: dbLoad, save: dbSave } = require('./db');
-const PATH = path.join(__dirname, 'data', 'notes.json');
 
 // ---------- persistence helpers ----------
 function loadNotes() { return dbLoad('notes', []); }
@@ -14,11 +12,9 @@ function saveNotes(notes) { dbSave('notes', notes); }
 // ---------- sanitize content: escape @everyone @here and user mentions ----------
 function sanitize(content) {
   if (typeof content !== 'string') return content;
-  // Replace @everyone and @here to prevent mass pings
-  return content
-    .replace(/@/g, '@\u200b') // zero-width space after @ to break mentions
-    .replace(/@everyone/gi, '@\u200beveryone')
-    .replace(/@here/gi, '@\u200bhere');
+  // Insert a zero-width space after every '@' so Discord parses no user
+  // mention, @everyone/@here, or role ping out of the stored text.
+  return content.replace(/@/g, '@\u200b');
 }
 
 // ---------- core actions ----------

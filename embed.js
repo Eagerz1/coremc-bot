@@ -9,7 +9,7 @@ const BRAND = {
 
 function brandEmbed(opts = {}) {
   const e = new EmbedBuilder()
-    .setColor(opts.color ?? BRAND.color)
+    .setColor(opts.color ?? global.cfg?.embedColor ?? BRAND.color)
     .setAuthor({ name: BRAND.name, iconURL: BRAND.icon })
     .setThumbnail(BRAND.icon);
   if (opts.title) e.setTitle(opts.title);

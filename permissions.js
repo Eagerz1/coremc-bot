@@ -36,7 +36,7 @@ const DEFAULT_PERMS = {
   'permissions.edit': 'MANAGER',
   'bot.giveaway': 'JR_ADMIN',
   'bot.panel': 'JR_ADMIN',
-  'notes.view': 'MEMBER',
+  'notes.view': 'HELPER',
   'notes.add': 'HELPER',
   'notes.remove': 'SR_MOD',
 };

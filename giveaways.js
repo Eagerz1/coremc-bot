@@ -105,11 +105,16 @@ async function publish(interaction, key) {
   return interaction.update({ content: '✅ Giveaway published below.', embeds: [], components: [] });
 }
 
+// Node caps a single timer at ~24.8 days and fires it *immediately* past that,
+// which would draw a long giveaway the moment it was published. Re-arm instead.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 function scheduleDraw(msgId) {
   const g = giveaways[msgId];
   if (!g || g.announced) return;
   const ms = Math.max(2000, g.endAt - Date.now());
-  setTimeout(() => draw(msgId).catch((e) => console.error('[gw] draw failed:', e.message)), ms);
+  const fire = () => draw(msgId).catch((e) => console.error('[gw] draw failed:', e.message));
+  if (ms > MAX_TIMER_MS) setTimeout(() => scheduleDraw(msgId), MAX_TIMER_MS);
+  else setTimeout(fire, ms);
 }
 
 async function draw(msgId) {
@@ -138,7 +143,7 @@ async function draw(msgId) {
     .setColor(winners.length ? 0x5865f2 : 0xed4245)
     .setDescription(
       winners.length
-        ? `**Winner(s):** ${winners.map((id) => `<@${id}>`).join(', ')}\\nContact staff to claim **${g.prize}**!`
+        ? `**Winner(s):** ${winners.map((id) => `<@${id}>`).join(', ')}\nContact staff to claim **${g.prize}**!`
         : 'Not enough entries — no winner this time.'
     );
 

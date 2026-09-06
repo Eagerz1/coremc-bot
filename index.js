@@ -13,6 +13,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   PermissionFlagsBits,
   ChannelType,
   OverwriteType,
@@ -155,7 +157,7 @@ const PANEL_EMBED = () =>
       [
         "**Need help? Open a ticket below.**",
         "",
-        "Pick the option that fits your issue and a private ticket will be created.",
+        "Select a topic from the **dropdown below** and a private ticket will be created.",
         "",
         ...TICKET_TOPICS.map((o) => `${o.emoji} **${o.label}** — ${o.desc}`),
         "",
@@ -164,22 +166,19 @@ const PANEL_EMBED = () =>
     )
     .setFooter({ text: "CoreMC • Support Team" })
     .setTimestamp();
-function panelButtons() {
-  const rows = [];
-  for (let i = 0; i < TICKET_TOPICS.length; i += 3) {
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        ...TICKET_TOPICS.slice(i, i + 3).map((o) =>
-          new ButtonBuilder()
-            .setCustomId(`ticket_open_${o.id}`)
-            .setLabel(o.label)
-            .setEmoji(o.emoji)
-            .setStyle(o.color),
-        ),
-      ),
-    );
-  }
-  return rows;
+function panelMenu() {
+  const options = TICKET_TOPICS.map((o) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(o.label)
+      .setValue(o.id)
+      .setDescription((o.desc || "").slice(0, 100))
+      .setEmoji(o.emoji),
+  );
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("ticket_menu")
+    .setPlaceholder("Choose a ticket type…")
+    .addOptions(options);
+  return [new ActionRowBuilder().addComponents(menu)];
 } // ---------------------------------------------------------------- client
 const FULL_INTENTS = [
   GatewayIntentBits.Guilds,
@@ -367,7 +366,7 @@ async function bindEvents(c) {
           case "tickets-panel": {
             await interaction.channel.send({
               embeds: [PANEL_EMBED()],
-              components: panelButtons(),
+              components: panelMenu(),
             });
             return interaction.reply({
               content: "✅ Panel posted.",
@@ -413,47 +412,6 @@ async function bindEvents(c) {
           }
           case "giveaway": {
             return require("./giveaways").startWizard(interaction);
-          }
-          case "partner_agree": {
-            // DM the user with the ad embed and collect member count
-            const user = interaction.user;
-            const guild = user.guild;
-            const { EmbedBuilder } = require("discord.js");
-            const adEmbed = new EmbedBuilder()
-              .setColor(0x5865f2)
-              .setTitle("🤝 Server Partnership — Advertise")
-              .setDescription(
-                `Please advertise our server in your Discord.\n\n` +
-                  `Our current member count: **${config.adChannelId ? "configured" : "?"}**\n` +
-                  `Our member requirements: **${config.minMemberCount || "?"}**+ members\n\n` +
-                  "After posting, click the button below to submit proof.",
-              ); // send DM
-            try {
-              await user.send({ embeds: [adEmbed] });
-            } catch {
-              return interaction
-                .reply({
-                  content:
-                    "❌ Could not DM you. Please enable DMs from server members.",
-                  ephemeral: true,
-                })
-                .catch(() => {});
-            } // add reactions/collect proof later — for now just acknowledge
-            return interaction
-              .reply({
-                content:
-                  "✅ I've DMd you the partnership requirements. Please post an ad in your server and submit a screenshot.",
-                ephemeral: true,
-              })
-              .catch(() => {});
-          }
-          case "partner_disagree": {
-            return interaction
-              .reply({
-                content: "❌ Partnership proposal cancelled.",
-                ephemeral: true,
-              })
-              .catch(() => {});
           }
           case "note": {
             // Staff-only command — check permission
@@ -632,10 +590,24 @@ async function bindEvents(c) {
           }
         }
       }
+      if (interaction.isStringSelectMenu()) {
+        if (interaction.customId === "ticket_menu") {
+          const topic = interaction.values[0];
+          return createTicket(interaction, topic);
+        }
+      }
       if (interaction.isButton()) {
         if (interaction.customId.startsWith("gw_")) {
           return require("./giveaways").onButton(interaction);
         }
+        if (interaction.customId === "partner_agree")
+          return handlePartnerAgree(interaction);
+        if (interaction.customId === "partner_disagree")
+          return handlePartnerDisagree(interaction);
+        if (interaction.customId === "partner_submitproof")
+          return openPartnerProofModal(interaction);
+        if (interaction.customId.startsWith("partner_verify_"))
+          return handlePartnerVerify(interaction);
         if (interaction.customId.startsWith("ticket_open_")) {
           return createTicket(
             interaction,
@@ -664,6 +636,8 @@ async function bindEvents(c) {
           return require("./applications").onVerdictButton(interaction);
       }
       if (interaction.isModalSubmit()) {
+        if (interaction.customId === "partner_proof")
+          return handlePartnerProofSubmit(interaction);
         if (interaction.customId === "gw_modal")
           return require("./giveaways").handleModal(interaction);
         if (interaction.customId.startsWith("ticket_closemodal_"))
@@ -1100,41 +1074,7 @@ async function resolveCloseRequest(interaction, approved) {
     const row = ActionRowBuilder.from(interaction.message.components[0]);
     row.components.forEach((cmp) => cmp.setDisabled(true));
     await interaction.message.edit({ components: [row] });
-  } catch {} // Check if this is a partner ticket
-  const nameMatch = channel.name.match(/^ticket-partner-/);
-  if (nameMatch) {
-    // This is a partner ticket - verify proof
-    const partnerEmbed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle("🤝 Partnership Proof Verification")
-      .addFields(
-        {
-          name: "Proof Submitted",
-          value: interaction.customId.includes("partner_verify_yes")
-            ? "✅ Approved"
-            : "❌ Denied",
-        },
-        {
-          name: "Verified by",
-          value: `<@${interaction.member.id}>`,
-          inline: true,
-        },
-      )
-      .setTimestamp();
-    await channel.send({ embeds: [partnerEmbed] }); // Determine action
-    const actionBtnRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("partner_verify_yes")
-        .setLabel("Yes ✅")
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId("partner_verify_no")
-        .setLabel("No ❌")
-        .setStyle(ButtonStyle.Danger),
-    );
-    await channel.send({ embeds: [partnerEmbed], components: [actionBtnRow] });
-    return interaction.deferUpdate();
-  }
+  } catch {}
   if (!approved) {
     await channel.send({
       embeds: [
@@ -1322,14 +1262,206 @@ async function ticketLog({ title, fields = [], color = "action" }) {
   } catch (e) {
     console.error("[ticketLog] failed:", e.message);
   }
+} // ------------------------------------------------------------ partnership flow
+// The applicant is the non-bot member whose overwrite grants access to the ticket.
+function partnerApplicantId(interaction) {
+  const ov = interaction.channel?.permissionOverwrites?.cache?.find(
+    (o) => o.type === 1 && o.id !== interaction.client.user.id,
+  );
+  return ov ? ov.id : null;
+}
+async function handlePartnerAgree(interaction) {
+  await interaction.deferUpdate();
+  const row = ActionRowBuilder.from(interaction.message.components[0]);
+  row.components.forEach((c) => c.setDisabled(true));
+  await interaction.message.edit({ components: [row] }).catch(() => {});
+  const emb = new EmbedBuilder()
+    .setColor(0x57f287)
+    .setTitle("🤝 Partnership — next steps")
+    .setDescription(
+      [
+        "Thanks for agreeing to partner with **CoreMC**!",
+        "",
+        "1. Invite **CoreMC** to your Discord (or post an ad for us there).",
+        `2. Our server requires **${config.minMemberCount || "50"}**+ members.`,
+        "3. Screenshot the ad, then click **Submit Proof** below with a link/screenshot.",
+        "",
+        "A Manager will review it and announce the partnership.",
+      ].join("\n"),
+    )
+    .setTimestamp();
+  const submitBtn = new ButtonBuilder()
+    .setCustomId("partner_submitproof")
+    .setLabel("Submit Proof")
+    .setEmoji("📎")
+    .setStyle(ButtonStyle.Success);
+  await interaction.user.send({ embeds: [emb] }).catch(() => {});
+  await interaction.channel.send({
+    embeds: [emb],
+    components: [new ActionRowBuilder().addComponents(submitBtn)],
+  });
+}
+async function handlePartnerDisagree(interaction) {
+  await interaction.deferUpdate();
+  const row = ActionRowBuilder.from(interaction.message.components[0]);
+  row.components.forEach((c) => c.setDisabled(true));
+  await interaction.message.edit({ components: [row] }).catch(() => {});
+  const emb = new EmbedBuilder()
+    .setColor(0xed4245)
+    .setTitle("🤝 Partnership cancelled")
+    .setDescription("You declined the partnership proposal.")
+    .setTimestamp();
+  await interaction.user.send({ embeds: [emb] }).catch(() => {});
+  setTimeout(() => interaction.channel.delete("Partnership declined").catch(() => {}), 4000);
+}
+async function openPartnerProofModal(interaction) {
+  const modal = new ModalBuilder()
+    .setCustomId("partner_proof")
+    .setTitle("Submit Partnership Proof");
+  const input = new TextInputBuilder()
+    .setCustomId("partner_proof_url")
+    .setLabel("Paste a link / screenshot URL of the ad")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(2000);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return interaction.showModal(modal);
+}
+async function handlePartnerProofSubmit(interaction) {
+  const proof = interaction.fields.getTextInputValue("partner_proof_url") || "";
+  const reviewer = config.staffGroupRoles?.higherstaff
+    ? `<@&${config.staffGroupRoles.higherstaff}>`
+    : "@higherstaff";
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`partner_verify_yes_${interaction.channel.id}`)
+      .setLabel("Approve ✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`partner_verify_no_${interaction.channel.id}`)
+      .setLabel("Reject ❌")
+      .setStyle(ButtonStyle.Danger),
+  );
+  const proofEmb = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("🤝 Partnership proof — review")
+    .setDescription(
+      `${reviewer}, please review the advertised proof from ${interaction.user}.`,
+    )
+    .addFields(
+      { name: "Proof link / screenshot", value: proof.slice(0, 1000) || "(none)" },
+      { name: "Applicant", value: `<@${interaction.user.id}>`, inline: true },
+    )
+    .setTimestamp();
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x57f287)
+        .setDescription(
+          `📎 Proof submitted. ${reviewer} will review it shortly.`,
+        ),
+    ],
+  });
+  await interaction.channel.send({ embeds: [proofEmb], components: [row] });
+}
+async function handlePartnerVerify(interaction) {
+  const parts = interaction.customId.split("_"); // partner_verify_<yes|no>_<channelId>
+  const approved = parts[2] === "yes";
+  const channelId = parts.slice(3).join("_");
+  if (!perms.can(interaction.member, "ticket.manager")) {
+    return interaction.reply({
+      content: "❌ Only **Manager+** can verify partnerships.",
+      ephemeral: true,
+    });
+  }
+  const ticket = interaction.channel;
+  const applicantId = partnerApplicantId(interaction);
+  try {
+    const row = ActionRowBuilder.from(interaction.message.components[0]);
+    row.components.forEach((c) => c.setDisabled(true));
+    await interaction.message.edit({ components: [row] });
+  } catch {}
+  const applicant = applicantId
+    ? await interaction.client.users.fetch(applicantId).catch(() => null)
+    : null;
+  if (approved) {
+    const ann = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle("🤝 New partnership")
+      .setDescription(
+        `We are now partnered with ${applicant ? `**${applicant.username}**` : "a new server"}!`,
+      )
+      .setFooter({ text: `Approved by ${interaction.user.tag}` })
+      .setTimestamp();
+    const target = config.partnershipsChannelId
+      ? interaction.guild.channels.cache.get(config.partnershipsChannelId)
+      : null;
+    if (target)
+      await target.send({ content: "@everyone", embeds: [ann] }).catch(() => {});
+    await interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x57f287)
+          .setDescription("✅ Partnership approved & announced."),
+      ],
+    });
+    if (applicant)
+      await applicant
+        .send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x57f287)
+              .setTitle("🤝 Approved!")
+              .setDescription(
+                "Your partnership with **CoreMC** has been approved. Welcome aboard!",
+              ),
+          ],
+        })
+        .catch(() => {});
+    await perms.log({
+      title: "🤝 Partnership approved",
+      fields: [
+        { name: "Applicant", value: `<@${applicantId} || ?>`, inline: true },
+        { name: "Approved by", value: `${interaction.user}`, inline: true },
+      ],
+      color: "good",
+    });
+    setTimeout(() => ticket?.delete("Partnership approved").catch(() => {}), 5000);
+  } else {
+    await interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setDescription("❌ Partnership declined."),
+      ],
+    });
+    if (applicant)
+      await applicant
+        .send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xed4245)
+              .setTitle("🤝 Not approved")
+              .setDescription(
+                "Your partnership proposal was declined. Open a new request if you have questions.",
+              ),
+          ],
+        })
+        .catch(() => {});
+    setTimeout(() => ticket?.delete("Partnership declined").catch(() => {}), 5000);
+  }
 } // ------------------------------------------------------------ health & selftest
 function assertPanelIntegrity() {
-  const rows = panelButtons();
-  const btns = rows.flatMap((r) => r.components.map((c) => c.data));
-  if (btns.length !== TICKET_TOPICS.length)
-    throw new Error(`button count ${btns.length} != ${TICKET_TOPICS.length}`);
-  if (new Set(btns.map((b) => b.custom_id)).size !== TICKET_TOPICS.length)
-    throw new Error("duplicate custom_id");
+  const rows = panelMenu();
+  const menu = rows[0]?.components?.[0];
+  if (!menu || menu.data?.type !== 3)
+    throw new Error("ticket panel must have a single select menu");
+  const options = menu.options || [];
+  if (options.length !== TICKET_TOPICS.length)
+    throw new Error(`panel options ${options.length} != ${TICKET_TOPICS.length}`);
+  const vals = options.map((o) => o.data?.value || o.value);
+  if (new Set(vals).size !== TICKET_TOPICS.length)
+    throw new Error("duplicate panel option value");
   if (PANEL_EMBED().data.title !== "CoreMC - Support")
     throw new Error("bad panel title");
   const xp = require("./xp");
@@ -1408,7 +1540,7 @@ function assertPanelIntegrity() {
     if (!permsMod.can(fakeMember([sg.higherstaff]), "ticket.punishment_appeal"))
       throw new Error("higherstaff appeal access fail");
   }
-  return `${btns.length} buttons / ${rows.length} rows + modules OK`;
+  return `${options.length} dropdown options / ${rows.length} menu rows + modules OK`;
 }
 
 // Config gaps no longer crash the bot. They switch the affected feature off and
